@@ -1,23 +1,18 @@
-name: Build C++ with Makefile
+# .github/workflows/build.yml
+name: Build BTC Miner
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install g++ and make
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ make
-
-      - name: Build project
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libixwebsocket-dev nlohmann-json3-dev
+      - name: Build
         run: make
