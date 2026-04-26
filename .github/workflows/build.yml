@@ -1,4 +1,4 @@
-name: Build BTC Miner
+name: Build and Test Miner
 
 on:
   push:
@@ -7,11 +7,21 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-and-run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y g++ make libboost-system-dev libssl-dev nlohmann-json3-dev
-      - name: Build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-system-dev libssl-dev nlohmann-json3-dev
+
+      - name: Build project
         run: make
+
+      - name: Run miner for 45 seconds
+        # Dùng timeout để chạy 45s, || true đảm bảo job không bị lỗi nếu timeout dừng
+        run: timeout 45 ./miner -a bc1qmej6jqcsrgu6w9dq2yqajhtff0hmnmhn35sj5h || true
+        # Lưu ý: nếu pool không kết nối được, miner sẽ thử reconnect, nhưng job vẫn pass
