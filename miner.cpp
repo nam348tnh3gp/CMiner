@@ -6,7 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-
+#include <vector>
 // Cấu trúc block header 80 byte
 struct BlockHeader {
     uint32_t version;
