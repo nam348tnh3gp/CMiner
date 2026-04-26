@@ -28,6 +28,7 @@ using namespace std::chrono;
 void stratumSubscribe();
 void stratumAuthorize();
 void stratumSubmit(uint32_t nonce);
+void startFakeJobTimer();
 
 // ==================== CẤU TRÚC BLOCK ====================
 struct BlockHeader {
@@ -70,13 +71,15 @@ std::mutex submitMutex;
 unsigned int numThreads;
 std::vector<std::thread> threads;
 std::atomic<bool> jobReceived{false};
+std::atomic<bool> authorized{false};
+bool useFakeJob = false;      // bật khi không có job thật
+std::atomic<bool> exitFlag{false};
 
 steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
-std::atomic<bool> authorized{false};
 
-// ==================== TCP STRATUM CLIENT ====================
+// ==================== TCP STRATUM CLIENT (giữ nguyên) ====================
 class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
@@ -185,7 +188,7 @@ bool checkTarget(const uint8_t* hash) {
     return false;
 }
 
-// ==================== STRATUM ====================
+// ==================== STRATUM (giữ lại để gửi thử, không quan trọng) ====================
 void stratumSend(const std::string& jsonStr) {
     if (stratumClient) stratumClient->send(jsonStr);
 }
@@ -197,14 +200,6 @@ void stratumSubscribe() {
     req["params"] = json::array({walletName + "/1.0"});
     std::cout << "📡 Subscribing: " << req.dump() << std::endl;
     stratumSend(req.dump());
-
-    std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        if (!authorized) {
-            std::cout << "⚠️ No subscribe reply, authorizing anyway..." << std::endl;
-            stratumAuthorize();
-        }
-    }).detach();
 }
 
 void stratumAuthorize() {
@@ -218,6 +213,13 @@ void stratumAuthorize() {
 }
 
 void stratumSubmit(uint32_t nonce) {
+    if (useFakeJob) {
+        std::cout << "🏆 [BENCHMARK] Found nonce: 0x" << std::hex << nonce << std::dec << std::endl;
+        // Tạo fake job mới ngay
+        startFakeJobTimer();
+        return;
+    }
+
     std::stringstream ss;
     ss << std::hex << nonce;
     json req;
@@ -237,6 +239,7 @@ void onStratumMessage(const std::string& msg) {
             auto params = doc["params"];
             if (params.size() < 8) return;
 
+            useFakeJob = false; // có job thật
             jobId = params[0].get<std::string>();
             std::string prevHashHex = params[1];
             std::string merkleHex = params[3];
@@ -312,6 +315,35 @@ void onStratumDisconnect() {
     jobReceived = false;
     shouldStopMining = true;
     authorized = false;
+    useFakeJob = false;
+
+    // Kết nối lại và kích hoạt fake job timer mới
+    stratumConnect();
+}
+
+// ==================== FAKE JOB (BENCHMARK) ====================
+void startFakeJobTimer() {
+    // Hủy timer cũ nếu có (không cần)
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        if (!jobReceived && !exitFlag && stratumClient) {
+            std::cout << "⚠️ No real job after 10s, starting BENCHMARK mode\n";
+            useFakeJob = true;
+
+            // Tạo header và target dễ (target = 0 để tìm nonce nhanh)
+            memset(header, 0x11, 76);
+            header[76] = 0x00; header[77] = 0x00; header[78] = 0x00; header[79] = 0x00;
+            memset(target, 0x00, 32);
+
+            solutionFound = false;
+            shouldStopMining = false;
+            totalHashes = 0;
+            lastTotalHashes = 0;
+            jobReceived = true;
+            startTime = steady_clock::now();
+            lastReport = startTime;
+        }
+    }).detach();
 }
 
 // ==================== KẾT NỐI ====================
@@ -327,8 +359,15 @@ void stratumConnect() {
 
     stratumClient = std::make_unique<StratumTCPClient>();
     stratumClient->setOnMessage(onStratumMessage);
-    stratumClient->setOnDisconnect([]() { onStratumDisconnect(); });
-    stratumClient->setOnConnect([]() { stratumSubscribe(); });
+    stratumClient->setOnDisconnect([]() {
+        // Chỉ gọi khi lỗi, không gọi lại nếu đã dừng
+        if (!exitFlag) onStratumDisconnect();
+    });
+    stratumClient->setOnConnect([]() {
+        stratumSubscribe();
+        // Bắt đầu đếm ngược benchmark nếu không có job thật
+        startFakeJobTimer();
+    });
     stratumClient->connect(poolHost, poolPort);
 }
 
@@ -397,7 +436,7 @@ void reportStats() {
 
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "⚡ " << hashrate / 1e6 << " MH/s | Total: "
-                  << currentTotal << " hashes | Pool: " << poolHost << std::endl;
+                  << currentTotal << " hashes | " << (useFakeJob ? "BENCHMARK" : poolHost) << std::endl;
 
         lastTotalHashes = currentTotal;
         lastReport = steady_clock::now();
@@ -405,7 +444,6 @@ void reportStats() {
 }
 
 // ==================== MAIN ====================
-std::atomic<bool> exitFlag{false};
 void signalHandler(int) {
     exitFlag = true;
     shouldStopMining = true;
@@ -449,7 +487,7 @@ int main(int argc, char* argv[]) {
     }
 
     numThreads = (numThreads > 0) ? numThreads : std::thread::hardware_concurrency();
-    std::cout << "🚀 Starting BTC Lottery Miner CLI (TCP)\n";
+    std::cout << "🚀 Starting BTC Miner CLI (auto benchmarks if no pool)\n";
     std::cout << "   Pool: " << poolHost << ":" << poolPort << "\n";
     std::cout << "   Address: " << btcAddress << "\n";
     std::cout << "   Worker: " << walletName << "\n";
@@ -469,11 +507,16 @@ int main(int argc, char* argv[]) {
         if (solutionFound) {
             stratumSubmit(bestNonce);
             solutionFound = false;
-            jobReceived = false;
-            shouldStopMining = true;
+            if (useFakeJob) {
+                // Bắt đầu fake job mới
+                startFakeJobTimer();
+            } else {
+                jobReceived = false;
+                shouldStopMining = true;
+            }
         }
 
-        if (!stratumClient && !btcAddress.empty()) {
+        if (!stratumClient && !btcAddress.empty() && !exitFlag) {
             static auto lastReconnect = steady_clock::now();
             auto now = steady_clock::now();
             if (duration_cast<seconds>(now - lastReconnect).count() > 10) {
