@@ -24,6 +24,11 @@ using tcp = net::ip::tcp;
 using json = nlohmann::json;
 using namespace std::chrono;
 
+// ==================== FORWARD DECLARATIONS ====================
+void stratumSubscribe();
+void stratumAuthorize();
+void stratumSubmit(uint32_t nonce);
+
 // ==================== CẤU TRÚC BLOCK ====================
 struct BlockHeader {
     uint32_t version;
@@ -37,7 +42,7 @@ struct BlockHeader {
 DSHA256 sha;
 
 // ==================== THAM SỐ ====================
-std::string poolHost = "stratum.slushpool.com";  // pool mặc định ổn định
+std::string poolHost = "stratum.slushpool.com";
 int poolPort = 3333;
 std::string btcAddress;
 std::string walletName = "CPUMiner";
@@ -69,8 +74,9 @@ std::atomic<bool> jobReceived{false};
 steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
+std::atomic<bool> authorized{false};
 
-// ==================== WEBSOCKET CLIENT TCP ====================
+// ==================== TCP STRATUM CLIENT ====================
 class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
@@ -128,7 +134,7 @@ private:
                     std::string line = buffer.substr(0, pos);
                     buffer.erase(0, pos + 1);
                     if (!line.empty()) {
-                        std::cout << "[POOL] " << line << std::endl; // debug
+                        std::cout << "[POOL] " << line << std::endl;
                         if (onMessage_) onMessage_(line);
                     }
                 }
@@ -184,8 +190,6 @@ void stratumSend(const std::string& jsonStr) {
     if (stratumClient) stratumClient->send(jsonStr);
 }
 
-std::atomic<bool> authorized{false};
-
 void stratumSubscribe() {
     json req;
     req["id"] = 1;
@@ -194,7 +198,6 @@ void stratumSubscribe() {
     std::cout << "📡 Subscribing: " << req.dump() << std::endl;
     stratumSend(req.dump());
 
-    // Nếu sau 2 giây không nhận được reply, vẫn gửi authorize
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         if (!authorized) {
@@ -276,7 +279,7 @@ void onStratumMessage(const std::string& msg) {
         }
 
         if (doc.contains("id") && doc["id"] == 1) {
-            authorized = true; // nhận được reply subscribe
+            authorized = true;
             std::cout << "📡 Subscribe reply received" << std::endl;
             stratumAuthorize();
         }
