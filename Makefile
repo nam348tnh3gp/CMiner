@@ -1,12 +1,9 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
-LDFLAGS = -lixwebsocket -lpthread
-
-# Thư mục chứa DSHA2.h nếu để cùng thư mục
 INCLUDES = -I.
+LDFLAGS = -lboost_system -lssl -lcrypto -lpthread
 
 TARGET = miner
-
 SRCS = miner.cpp
 OBJS = $(SRCS:.cpp=.o)
 
