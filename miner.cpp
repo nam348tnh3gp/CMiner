@@ -1,7 +1,4 @@
 #include "DSHA2.h"
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/beast/ssl.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <nlohmann/json.hpp>
@@ -19,14 +16,10 @@
 #include <mutex>
 #include <functional>
 #include <memory>
-#include <variant>
 #include <csignal>
 
-namespace beast = boost::beast;
-namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
-namespace ssl = net::ssl;
 using json = nlohmann::json;
 using namespace std::chrono;
 
@@ -48,16 +41,10 @@ int poolPort = 3333;
 std::string btcAddress;
 std::string walletName = "CPUMiner";
 
-struct PoolInfo {
-    std::string host;
-    int port;
-    bool ssl;
-};
-std::vector<PoolInfo> backupPools = {
-    {"public-pool.io", 3333, false},
-    {"public-pool.io", 4333, true},
-    {"pool.vkbit.com", 3333, false},
-    {"stratum.slushpool.com", 3333, false}
+std::vector<std::pair<std::string, int>> backupPools = {
+    {"public-pool.io", 3333},
+    {"pool.vkbit.com", 3333},
+    {"stratum.slushpool.com", 3333}
 };
 int currentPoolIndex = 0;
 
@@ -82,39 +69,25 @@ steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
 
-// ==================== WEBSOCKET CLIENT ====================
-using ws_stream = websocket::stream<tcp::socket>;
-using wss_stream = websocket::stream<beast::ssl_stream<tcp::socket>>;
-
-class StratumClient {
+// ==================== TCP STRATUM CLIENT ====================
+class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
     using OnDisconnect = std::function<void()>;
 
-    StratumClient() : ioc_(1), resolver_(ioc_), ssl_ctx_(ssl::context::tlsv12_client) {
-        ssl_ctx_.set_verify_mode(ssl::verify_none);
-    }
+    StratumTCPClient() : ioc_(), socket_(ioc_) {}
 
-    void connect(const std::string& host, const std::string& port, bool useSSL) {
+    void connect(const std::string& host, int port) {
         host_ = host;
         port_ = port;
-        useSSL_ = useSSL;
-        if (useSSL) {
-            ws_.emplace<wss_stream>(ioc_, ssl_ctx_);
-        } else {
-            ws_.emplace<ws_stream>(ioc_);
-        }
         thread_ = std::thread([this]() { run(); });
     }
 
     void send(const std::string& msg) {
         net::post(ioc_, [this, msg]() {
-            std::visit([&](auto& ws) {
-                using T = std::decay_t<decltype(ws)>;
-                if constexpr (!std::is_same_v<T, std::monostate>) {
-                    try { ws.write(net::buffer(msg)); } catch (...) {}
-                }
-            }, ws_);
+            try {
+                net::write(socket_, net::buffer(msg + "\n"));
+            } catch (...) {}
         });
     }
 
@@ -123,15 +96,7 @@ public:
 
     void stop() {
         net::post(ioc_, [this]() {
-            std::visit([&](auto& ws) {
-                using T = std::decay_t<decltype(ws)>;
-                if constexpr (!std::is_same_v<T, std::monostate>) {
-                    try {
-                        if (ws.is_open())
-                            ws.close(websocket::close_code::normal);
-                    } catch (...) {}
-                }
-            }, ws_);
+            try { socket_.close(); } catch (...) {}
             ioc_.stop();
         });
         if (thread_.joinable()) thread_.join();
@@ -140,70 +105,44 @@ public:
 private:
     void run() {
         try {
-            auto const results = resolver_.resolve(host_, port_);
-            if (useSSL_) {
-                auto& wss = std::get<wss_stream>(ws_);
-                // Thêm handshake headers
-                wss.set_option(websocket::stream_base::decorator(
-                    [](websocket::request_type& req) {
-                        req.set(beast::http::field::user_agent, "BTC-Miner/1.0");
-                        req.set(beast::http::field::origin, "https://localhost");
-                    }
-                ));
-                auto& ssl_layer = wss.next_layer();
-                auto ep = net::connect(beast::get_lowest_layer(wss), results);
-                if (!SSL_set_tlsext_host_name(ssl_layer.native_handle(), host_.c_str()))
-                    throw beast::system_error(beast::error_code(
-                        static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()));
-                ssl_layer.handshake(ssl::stream_base::client);
-                wss.handshake(host_ + ":" + std::to_string(ep.port()), "/");
-                std::cout << "✅ Connected (WSS) to " << host_ << ":" << ep.port() << std::endl;
-                readLoop(wss);
-            } else {
-                auto& ws = std::get<ws_stream>(ws_);
-                // Thêm handshake headers
-                ws.set_option(websocket::stream_base::decorator(
-                    [](websocket::request_type& req) {
-                        req.set(beast::http::field::user_agent, "BTC-Miner/1.0");
-                        req.set(beast::http::field::origin, "http://localhost");
-                    }
-                ));
-                auto ep = net::connect(ws.next_layer(), results);
-                ws.handshake(host_ + ":" + std::to_string(ep.port()), "/");
-                std::cout << "✅ Connected (WS) to " << host_ << ":" << ep.port() << std::endl;
-                readLoop(ws);
+            tcp::resolver resolver(ioc_);
+            auto endpoints = resolver.resolve(host_, std::to_string(port_));
+            net::connect(socket_, endpoints);
+            std::cout << "✅ Connected (TCP) to " << host_ << ":" << port_ << std::endl;
+
+            std::string buffer;
+            while (true) {
+                char data[4096];
+                boost::system::error_code ec;
+                size_t len = socket_.read_some(net::buffer(data), ec);
+                if (ec) throw boost::system::system_error(ec);
+                buffer.append(data, len);
+                // Tách các dòng JSON hoàn chỉnh (kết thúc bằng '\n')
+                size_t pos;
+                while ((pos = buffer.find('\n')) != std::string::npos) {
+                    std::string line = buffer.substr(0, pos);
+                    buffer.erase(0, pos + 1);
+                    if (onMessage_ && !line.empty()) onMessage_(line);
+                }
             }
         } catch (const std::exception& e) {
-            std::cerr << "❌ WebSocket error: " << e.what() << std::endl;
+            std::cerr << "❌ TCP error: " << e.what() << std::endl;
         }
         if (onDisconnect_) onDisconnect_();
     }
 
-    template<typename Stream>
-    void readLoop(Stream& stream) {
-        beast::flat_buffer buffer;
-        while (true) {
-            stream.read(buffer);
-            std::string msg = beast::buffers_to_string(buffer.data());
-            buffer.clear();
-            if (onMessage_) onMessage_(msg);
-        }
-    }
-
     net::io_context ioc_;
-    tcp::resolver resolver_;
-    ssl::context ssl_ctx_;
-    std::variant<std::monostate, ws_stream, wss_stream> ws_;
-    std::string host_, port_;
-    bool useSSL_;
+    tcp::socket socket_;
+    std::string host_;
+    int port_;
     std::thread thread_;
     OnMessage onMessage_;
     OnDisconnect onDisconnect_;
 };
 
-std::unique_ptr<StratumClient> wsClient;
+std::unique_ptr<StratumTCPClient> stratumClient;
 
-// ==================== HEX/BYTE HELPERS ====================
+// ==================== HEX HELPERS ====================
 uint8_t hexToByte(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -233,7 +172,7 @@ bool checkTarget(const uint8_t* hash) {
 
 // ==================== STRATUM ====================
 void stratumSend(const std::string& jsonStr) {
-    if (wsClient) wsClient->send(jsonStr);
+    if (stratumClient) stratumClient->send(jsonStr);
 }
 
 void stratumSubscribe() {
@@ -267,7 +206,7 @@ void stratumSubmit(uint32_t nonce) {
 }
 
 // ==================== XỬ LÝ TIN NHẮN ====================
-void onWsMessage(const std::string& msg) {
+void onStratumMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
 
@@ -324,7 +263,7 @@ void onWsMessage(const std::string& msg) {
             bool success = doc["result"].get<bool>();
             if (!success) {
                 std::cerr << "❌ Auth failed" << std::endl;
-                if (wsClient) wsClient->stop();
+                if (stratumClient) stratumClient->stop();
             } else {
                 std::cout << "🔑 Authorized successfully" << std::endl;
             }
@@ -339,13 +278,12 @@ void onWsMessage(const std::string& msg) {
     }
 }
 
-void onWsDisconnect() {
+void onStratumDisconnect() {
     std::cout << "❌ Pool disconnected" << std::endl;
     currentPoolIndex = (currentPoolIndex + 1) % backupPools.size();
-    poolHost = backupPools[currentPoolIndex].host;
-    poolPort = backupPools[currentPoolIndex].port;
-    std::cout << "🔄 Switching to pool: " << poolHost << ":" << poolPort
-              << (backupPools[currentPoolIndex].ssl ? " (WSS)" : " (WS)") << std::endl;
+    poolHost = backupPools[currentPoolIndex].first;
+    poolPort = backupPools[currentPoolIndex].second;
+    std::cout << "🔄 Switching to pool: " << poolHost << ":" << poolPort << std::endl;
     jobReceived = false;
     shouldStopMining = true;
 }
@@ -356,18 +294,15 @@ void stratumConnect() {
         std::cerr << "⚠️ BTC address not set!" << std::endl;
         return;
     }
-    if (wsClient) {
-        wsClient->stop();
-        wsClient.reset();
+    if (stratumClient) {
+        stratumClient->stop();
+        stratumClient.reset();
     }
 
-    bool useSSL = (poolPort == 4333 || poolPort == 443 ||
-                   backupPools[currentPoolIndex].ssl);
-
-    wsClient = std::make_unique<StratumClient>();
-    wsClient->setOnMessage(onWsMessage);
-    wsClient->setOnDisconnect([]() { onWsDisconnect(); });
-    wsClient->connect(poolHost, std::to_string(poolPort), useSSL);
+    stratumClient = std::make_unique<StratumTCPClient>();
+    stratumClient->setOnMessage(onStratumMessage);
+    stratumClient->setOnDisconnect([]() { onStratumDisconnect(); });
+    stratumClient->connect(poolHost, poolPort);
 }
 
 // ==================== MINING ====================
@@ -447,7 +382,7 @@ std::atomic<bool> exitFlag{false};
 void signalHandler(int) {
     exitFlag = true;
     shouldStopMining = true;
-    if (wsClient) wsClient->stop();
+    if (stratumClient) stratumClient->stop();
 }
 
 int main(int argc, char* argv[]) {
@@ -461,8 +396,8 @@ int main(int argc, char* argv[]) {
                 poolHost = argv[++i];
                 bool found = false;
                 for (auto& bp : backupPools) {
-                    if (bp.host == poolHost) {
-                        poolPort = bp.port;
+                    if (bp.first == poolHost) {
+                        poolPort = bp.second;
                         found = true;
                         break;
                     }
@@ -487,9 +422,8 @@ int main(int argc, char* argv[]) {
     }
 
     numThreads = (numThreads > 0) ? numThreads : std::thread::hardware_concurrency();
-    std::cout << "🚀 Starting BTC Lottery Miner CLI\n";
-    std::cout << "   Pool: " << poolHost << ":" << poolPort
-              << (backupPools[currentPoolIndex].ssl ? " (WSS)" : " (WS)") << "\n";
+    std::cout << "🚀 Starting BTC Lottery Miner CLI (TCP)\n";
+    std::cout << "   Pool: " << poolHost << ":" << poolPort << "\n";
     std::cout << "   Address: " << btcAddress << "\n";
     std::cout << "   Worker: " << walletName << "\n";
     std::cout << "   Threads: " << numThreads << "\n\n";
@@ -512,7 +446,7 @@ int main(int argc, char* argv[]) {
             shouldStopMining = true;
         }
 
-        if (!wsClient && !btcAddress.empty()) {
+        if (!stratumClient && !btcAddress.empty()) {
             static auto lastReconnect = steady_clock::now();
             auto now = steady_clock::now();
             if (duration_cast<seconds>(now - lastReconnect).count() > 10) {
@@ -524,7 +458,7 @@ int main(int argc, char* argv[]) {
     }
 
     shouldStopMining = true;
-    if (wsClient) wsClient->stop();
+    if (stratumClient) stratumClient->stop();
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
