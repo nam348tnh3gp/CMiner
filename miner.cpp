@@ -1,6 +1,7 @@
 #include "DSHA2.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/write.hpp>          // <-- thêm dòng này
 #include <nlohmann/json.hpp>
 
 #include <iostream>
@@ -86,7 +87,8 @@ public:
     void send(const std::string& msg) {
         net::post(ioc_, [this, msg]() {
             try {
-                net::write(socket_, net::buffer(msg + "\n"));
+                std::string line = msg + "\n";
+                net::write(socket_, net::buffer(line));
             } catch (...) {}
         });
     }
@@ -117,7 +119,6 @@ private:
                 size_t len = socket_.read_some(net::buffer(data), ec);
                 if (ec) throw boost::system::system_error(ec);
                 buffer.append(data, len);
-                // Tách các dòng JSON hoàn chỉnh (kết thúc bằng '\n')
                 size_t pos;
                 while ((pos = buffer.find('\n')) != std::string::npos) {
                     std::string line = buffer.substr(0, pos);
@@ -142,7 +143,7 @@ private:
 
 std::unique_ptr<StratumTCPClient> stratumClient;
 
-// ==================== HEX HELPERS ====================
+// ==================== HEX HELPERS (giữ nguyên) ====================
 uint8_t hexToByte(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -205,7 +206,7 @@ void stratumSubmit(uint32_t nonce) {
     stratumSend(req.dump());
 }
 
-// ==================== XỬ LÝ TIN NHẮN ====================
+// ==================== XỬ LÝ TIN NHẮN (giữ nguyên) ====================
 void onStratumMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
