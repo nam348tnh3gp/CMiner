@@ -13,8 +13,9 @@ HEADERS  = DSHA2.h
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-# Biên dịch file .cpp thành .o, phụ thuộc vào header
-$(OBJS): $(HEADERS)
+# Quy tắc tường minh để biên dịch .cpp -> .o, phụ thuộc vào header
+%.o: %.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Dọn dẹp
 .PHONY: clean
