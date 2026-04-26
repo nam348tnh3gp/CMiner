@@ -37,15 +37,15 @@ struct BlockHeader {
 DSHA256 sha;
 
 // ==================== THAM SỐ ====================
-std::string poolHost = "public-pool.io";
+std::string poolHost = "stratum.slushpool.com";  // pool mặc định ổn định
 int poolPort = 3333;
 std::string btcAddress;
 std::string walletName = "CPUMiner";
 
 std::vector<std::pair<std::string, int>> backupPools = {
-    {"public-pool.io", 3333},
+    {"stratum.slushpool.com", 3333},
     {"pool.vkbit.com", 3333},
-    {"stratum.slushpool.com", 3333}
+    {"public-pool.io", 3333}
 };
 int currentPoolIndex = 0;
 
@@ -70,12 +70,12 @@ steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
 
-// ==================== TCP STRATUM CLIENT ====================
+// ==================== WEBSOCKET CLIENT TCP ====================
 class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
     using OnDisconnect = std::function<void()>;
-    using OnConnect = std::function<void()>;   // <-- thêm
+    using OnConnect = std::function<void()>;
 
     StratumTCPClient() : ioc_(), socket_(ioc_) {}
 
@@ -96,7 +96,7 @@ public:
 
     void setOnMessage(OnMessage cb) { onMessage_ = std::move(cb); }
     void setOnDisconnect(OnDisconnect cb) { onDisconnect_ = std::move(cb); }
-    void setOnConnect(OnConnect cb) { onConnect_ = std::move(cb); }   // <-- thêm
+    void setOnConnect(OnConnect cb) { onConnect_ = std::move(cb); }
 
     void stop() {
         net::post(ioc_, [this]() {
@@ -114,7 +114,6 @@ private:
             net::connect(socket_, endpoints);
             std::cout << "✅ Connected (TCP) to " << host_ << ":" << port_ << std::endl;
 
-            // Gọi callback báo đã kết nối để gửi subscribe
             if (onConnect_) onConnect_();
 
             std::string buffer;
@@ -128,7 +127,10 @@ private:
                 while ((pos = buffer.find('\n')) != std::string::npos) {
                     std::string line = buffer.substr(0, pos);
                     buffer.erase(0, pos + 1);
-                    if (onMessage_ && !line.empty()) onMessage_(line);
+                    if (!line.empty()) {
+                        std::cout << "[POOL] " << line << std::endl; // debug
+                        if (onMessage_) onMessage_(line);
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -144,7 +146,7 @@ private:
     std::thread thread_;
     OnMessage onMessage_;
     OnDisconnect onDisconnect_;
-    OnConnect onConnect_;   // <-- thêm
+    OnConnect onConnect_;
 };
 
 std::unique_ptr<StratumTCPClient> stratumClient;
@@ -182,6 +184,8 @@ void stratumSend(const std::string& jsonStr) {
     if (stratumClient) stratumClient->send(jsonStr);
 }
 
+std::atomic<bool> authorized{false};
+
 void stratumSubscribe() {
     json req;
     req["id"] = 1;
@@ -189,6 +193,15 @@ void stratumSubscribe() {
     req["params"] = json::array({walletName + "/1.0"});
     std::cout << "📡 Subscribing: " << req.dump() << std::endl;
     stratumSend(req.dump());
+
+    // Nếu sau 2 giây không nhận được reply, vẫn gửi authorize
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (!authorized) {
+            std::cout << "⚠️ No subscribe reply, authorizing anyway..." << std::endl;
+            stratumAuthorize();
+        }
+    }).detach();
 }
 
 void stratumAuthorize() {
@@ -262,7 +275,9 @@ void onStratumMessage(const std::string& msg) {
             std::cout << "📦 New job #" << jobId << " from " << poolHost << std::endl;
         }
 
-        if (doc.contains("id") && doc["id"] == 1 && doc.contains("result")) {
+        if (doc.contains("id") && doc["id"] == 1) {
+            authorized = true; // nhận được reply subscribe
+            std::cout << "📡 Subscribe reply received" << std::endl;
             stratumAuthorize();
         }
 
@@ -293,6 +308,7 @@ void onStratumDisconnect() {
     std::cout << "🔄 Switching to pool: " << poolHost << ":" << poolPort << std::endl;
     jobReceived = false;
     shouldStopMining = true;
+    authorized = false;
 }
 
 // ==================== KẾT NỐI ====================
@@ -309,11 +325,11 @@ void stratumConnect() {
     stratumClient = std::make_unique<StratumTCPClient>();
     stratumClient->setOnMessage(onStratumMessage);
     stratumClient->setOnDisconnect([]() { onStratumDisconnect(); });
-    stratumClient->setOnConnect([]() { stratumSubscribe(); });  // <-- quan trọng
+    stratumClient->setOnConnect([]() { stratumSubscribe(); });
     stratumClient->connect(poolHost, poolPort);
 }
 
-// ==================== MINING (giữ nguyên) ====================
+// ==================== MINING ====================
 void minerThread(int threadId) {
     BlockHeader localHeader;
     uint8_t hash[32];
@@ -365,7 +381,7 @@ void minerThread(int threadId) {
     }
 }
 
-// ==================== BÁO CÁO (giữ nguyên) ====================
+// ==================== BÁO CÁO ====================
 void reportStats() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
