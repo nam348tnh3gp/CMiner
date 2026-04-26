@@ -1,7 +1,7 @@
 #include "DSHA2.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/write.hpp>          // <-- thêm dòng này
+#include <boost/asio/write.hpp>
 #include <nlohmann/json.hpp>
 
 #include <iostream>
@@ -75,6 +75,7 @@ class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
     using OnDisconnect = std::function<void()>;
+    using OnConnect = std::function<void()>;   // <-- thêm
 
     StratumTCPClient() : ioc_(), socket_(ioc_) {}
 
@@ -95,6 +96,7 @@ public:
 
     void setOnMessage(OnMessage cb) { onMessage_ = std::move(cb); }
     void setOnDisconnect(OnDisconnect cb) { onDisconnect_ = std::move(cb); }
+    void setOnConnect(OnConnect cb) { onConnect_ = std::move(cb); }   // <-- thêm
 
     void stop() {
         net::post(ioc_, [this]() {
@@ -111,6 +113,9 @@ private:
             auto endpoints = resolver.resolve(host_, std::to_string(port_));
             net::connect(socket_, endpoints);
             std::cout << "✅ Connected (TCP) to " << host_ << ":" << port_ << std::endl;
+
+            // Gọi callback báo đã kết nối để gửi subscribe
+            if (onConnect_) onConnect_();
 
             std::string buffer;
             while (true) {
@@ -139,11 +144,12 @@ private:
     std::thread thread_;
     OnMessage onMessage_;
     OnDisconnect onDisconnect_;
+    OnConnect onConnect_;   // <-- thêm
 };
 
 std::unique_ptr<StratumTCPClient> stratumClient;
 
-// ==================== HEX HELPERS (giữ nguyên) ====================
+// ==================== HEX HELPERS ====================
 uint8_t hexToByte(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -206,7 +212,7 @@ void stratumSubmit(uint32_t nonce) {
     stratumSend(req.dump());
 }
 
-// ==================== XỬ LÝ TIN NHẮN (giữ nguyên) ====================
+// ==================== XỬ LÝ TIN NHẮN ====================
 void onStratumMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
@@ -303,10 +309,11 @@ void stratumConnect() {
     stratumClient = std::make_unique<StratumTCPClient>();
     stratumClient->setOnMessage(onStratumMessage);
     stratumClient->setOnDisconnect([]() { onStratumDisconnect(); });
+    stratumClient->setOnConnect([]() { stratumSubscribe(); });  // <-- quan trọng
     stratumClient->connect(poolHost, poolPort);
 }
 
-// ==================== MINING ====================
+// ==================== MINING (giữ nguyên) ====================
 void minerThread(int threadId) {
     BlockHeader localHeader;
     uint8_t hash[32];
@@ -358,7 +365,7 @@ void minerThread(int threadId) {
     }
 }
 
-// ==================== BÁO CÁO ====================
+// ==================== BÁO CÁO (giữ nguyên) ====================
 void reportStats() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
