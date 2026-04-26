@@ -1,23 +1,24 @@
-# Trình biên dịch và các cờ
-CXX      = g++
-CXXFLAGS = -std=c++11 -O3 -march=native -mtune=native -Wall -Wextra -pthread
-LDFLAGS  = -pthread
+CXX = g++
+CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
+LDFLAGS = -lixwebsocket -lpthread
 
-# Tên file thực thi và các file nguồn
-TARGET   = miner
-SRCS     = miner.cpp
-OBJS     = $(SRCS:.cpp=.o)
-HEADERS  = DSHA2.h
+# Thư mục chứa DSHA2.h nếu để cùng thư mục
+INCLUDES = -I.
 
-# Mục tiêu mặc định
+TARGET = miner
+
+SRCS = miner.cpp
+OBJS = $(SRCS:.cpp=.o)
+
+all: $(TARGET)
+
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 
-# Quy tắc tường minh để biên dịch .cpp -> .o, phụ thuộc vào header
-%.o: %.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Dọn dẹp
-.PHONY: clean
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all clean
