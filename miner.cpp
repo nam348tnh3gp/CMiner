@@ -1,9 +1,9 @@
 #include "DSHA2.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/beast/ssl.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl.hpp>
 #include <nlohmann/json.hpp>
 
 #include <iostream>
@@ -86,7 +86,7 @@ uint64_t lastTotalHashes = 0;
 
 // ==================== WEBSOCKET CLIENT (WS + WSS) ====================
 using ws_stream = websocket::stream<tcp::socket>;
-using wss_stream = websocket::stream<ssl::stream<tcp::socket>>;
+using wss_stream = websocket::stream<beast::ssl_stream<tcp::socket>>;
 
 class StratumClient {
 public:
@@ -129,14 +129,8 @@ public:
                 using T = std::decay_t<decltype(ws)>;
                 if constexpr (!std::is_same_v<T, std::monostate>) {
                     try {
-                        if (ws.is_open()) {
-                            if constexpr (std::is_same_v<T, wss_stream>) {
-                                // WSS: chỉ đóng transport, không gửi close frame WebSocket
-                                beast::get_lowest_layer(ws).close();
-                            } else {
-                                ws.close(websocket::close_code::normal);
-                            }
-                        }
+                        if (ws.is_open())
+                            ws.close(websocket::close_code::normal);
                     } catch (...) {}
                 }
             }, ws_);
@@ -151,11 +145,12 @@ private:
             auto const results = resolver_.resolve(host_, port_);
             if (useSSL_) {
                 auto& wss = std::get<wss_stream>(ws_);
+                auto& ssl_layer = wss.next_layer();
                 auto ep = net::connect(beast::get_lowest_layer(wss), results);
-                if (!SSL_set_tlsext_host_name(wss.next_layer().native_handle(), host_.c_str()))
+                if (!SSL_set_tlsext_host_name(ssl_layer.native_handle(), host_.c_str()))
                     throw beast::system_error(beast::error_code(
                         static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()));
-                wss.next_layer().handshake(ssl::stream_base::client);
+                ssl_layer.handshake(ssl::stream_base::client);
                 wss.handshake(host_ + ":" + std::to_string(ep.port()), "/");
                 std::cout << "✅ Connected (WSS) to " << host_ << ":" << ep.port() << std::endl;
                 readLoop(wss);
