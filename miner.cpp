@@ -37,6 +37,19 @@ struct BlockHeader {
 
 DSHA256 sha;
 
+// ==================== HÀM HASH ====================
+// Double SHA-256 dùng DSHA256 (dữ liệu tùy ý)
+void doubleSHA256(const uint8_t* data, size_t len, uint8_t* out) {
+    uint8_t tmp[32];
+    DSHA256 ctx;
+    ctx.reset();
+    ctx.write(data, len);
+    ctx.finalize(tmp);
+    ctx.reset();
+    ctx.write(tmp, 32);
+    ctx.finalize(out);
+}
+
 // ==================== THAM SỐ ====================
 std::string poolHost = "stratum.slushpool.com";
 int poolPort = 3333;
@@ -67,7 +80,7 @@ StratumJob currentJob;
 std::mutex jobMutex;
 std::string extranonce1;
 size_t extranonce2_size = 0;
-uint32_t extranonce2_counter = 0;   // tăng sau mỗi lần dùng
+uint32_t extranonce2_counter = 0;
 
 std::atomic<bool> solutionFound{false};
 std::atomic<bool> shouldStopMining{false};
@@ -192,12 +205,6 @@ static void reverseBytes(uint8_t* data, size_t len) {
         std::swap(data[i], data[len - 1 - i]);
 }
 
-static void sha256d(uint8_t* out, const uint8_t* data, size_t len) {
-    uint8_t tmp[32];
-    sha.hashBlockHeader(data, tmp, len); // giả sử DSHA2.h có hashBlockHeader(,,len)
-    sha.hashBlockHeader(tmp, out, 32);
-}
-
 // ==================== STRATUM GỬI LỆNH ====================
 void stratumSend(const std::string& jsonStr) {
     if (stratumClient) stratumClient->send(jsonStr);
@@ -231,25 +238,22 @@ void stratumSubmit(uint32_t nonce, const std::string& ntime, const std::string& 
     stratumSend(req.dump());
 }
 
-// ==================== XỬ LÝ TIN NHẮN TỪ POOL ====================
+// ==================== XỬ LÝ TIN NHẮN ====================
 void onStratumMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
 
-        // Phản hồi subscribe
         if (doc.contains("id") && doc["id"] == 1 && doc.contains("result")) {
             auto result = doc["result"];
             if (result.is_array() && result.size() >= 2) {
                 extranonce1 = result[1].get<std::string>();
                 extranonce2_size = result[2].get<int>();
                 std::cout << "📡 Subscribed, extranonce1=" << extranonce1 << ", extranonce2_size=" << extranonce2_size << std::endl;
-                // Sau subscribe, authorize ngay
                 stratumAuthorize();
             }
             return;
         }
 
-        // Phản hồi authorize
         if (doc.contains("id") && doc["id"] == 2) {
             if (doc["result"].get<bool>()) {
                 authorized = true;
@@ -261,20 +265,15 @@ void onStratumMessage(const std::string& msg) {
             return;
         }
 
-        // Phản hồi submit
         if (doc.contains("id") && doc["id"] == 4) {
             bool accepted = doc["result"].get<bool>();
             std::cout << (accepted ? "✅ Share accepted!" : "❌ Share rejected!") << std::endl;
             return;
         }
 
-        // mining.notify
         if (doc.contains("method") && doc["method"] == "mining.notify") {
             auto params = doc["params"];
-            if (params.size() < 9) {
-                std::cerr << "Invalid mining.notify params" << std::endl;
-                return;
-            }
+            if (params.size() < 9) return;
 
             StratumJob newJob;
             newJob.job_id = params[0].get<std::string>();
@@ -293,10 +292,9 @@ void onStratumMessage(const std::string& msg) {
             {
                 std::lock_guard<std::mutex> lock(jobMutex);
                 currentJob = newJob;
-                extranonce2_counter = 0; // reset
+                extranonce2_counter = 0;
             }
 
-            // Khởi động đào
             solutionFound = false;
             shouldStopMining = false;
             totalHashes = 0;
@@ -341,17 +339,14 @@ void stratumConnect() {
     stratumClient->connect(poolHost, poolPort);
 }
 
-// ==================== ĐÀO ====================
-// Tạo merkle root từ coinbase và merkle_branch
-static std::string buildMerkleRoot(const StratumJob& job, const std::string& extranonce2) {
-    // coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+// ==================== MERKLE ROOT ====================
+std::string buildMerkleRoot(const StratumJob& job, const std::string& extranonce2) {
     std::string coinbase = job.coinb1 + extranonce1 + extranonce2 + job.coinb2;
-    // Chuyển coinbase hex sang binary
     std::vector<uint8_t> coinb_bin(coinbase.length() / 2);
     hexToBytes(coinbase, coinb_bin.data(), coinb_bin.size());
 
     uint8_t merkle_root[32];
-    sha256d(merkle_root, coinb_bin.data(), coinb_bin.size());
+    doubleSHA256(coinb_bin.data(), coinb_bin.size(), merkle_root);
 
     for (const auto& branch : job.merkle_branch) {
         std::vector<uint8_t> branch_bin(branch.length() / 2);
@@ -359,18 +354,20 @@ static std::string buildMerkleRoot(const StratumJob& job, const std::string& ext
         uint8_t concat[64];
         memcpy(concat, merkle_root, 32);
         memcpy(concat + 32, branch_bin.data(), 32);
-        sha256d(merkle_root, concat, 64);
+        doubleSHA256(concat, 64, merkle_root);
     }
 
     return bin2hex(merkle_root, 32);
 }
 
+// ==================== MINING THREAD ====================
 void minerThread(int threadId) {
     uint8_t header[80];
     uint8_t target[32];
     uint8_t hash[32];
     std::string extranonce2_hex;
     uint32_t nonce;
+    std::string localExtranonce2;
 
     while (true) {
         if (shouldStopMining) {
@@ -382,13 +379,10 @@ void minerThread(int threadId) {
             continue;
         }
 
-        // Lấy job và tạo extranonce2 riêng (an toàn luồng)
         StratumJob localJob;
-        std::string localExtranonce2;
         {
             std::lock_guard<std::mutex> lock(jobMutex);
             localJob = currentJob;
-            // Tăng extranonce2 (little-endian hex)
             uint32_t counter = extranonce2_counter++;
             std::stringstream ss;
             ss << std::hex << std::setfill('0') << std::setw(extranonce2_size * 2) << counter;
@@ -398,41 +392,33 @@ void minerThread(int threadId) {
         }
 
         std::string merkleRootHex = buildMerkleRoot(localJob, localExtranonce2);
-        // Build header (80 bytes)
+
         memset(header, 0, 80);
-        // version (4 bytes little-endian)
         hexToBytes(localJob.version, header, 4);
         reverseBytes(header, 4);
-        // prevhash (32 bytes)
         hexToBytes(localJob.prevhash, header + 4, 32);
         reverseBytes(header + 4, 32);
-        // merkle root (32 bytes)
         hexToBytes(merkleRootHex, header + 36, 32);
         reverseBytes(header + 36, 32);
-        // timestamp (4 bytes)
         hexToBytes(localJob.ntime, header + 68, 4);
         reverseBytes(header + 68, 4);
-        // bits (4 bytes)
         hexToBytes(localJob.nbits, header + 72, 4);
         reverseBytes(header + 72, 4);
-        // nonce sẽ được điền sau
 
-        // Tính target từ nbits
-        {
-            uint32_t bits;
-            memcpy(&bits, header + 72, 4);
-            bits = __builtin_bswap32(bits);
-            uint32_t exp = bits >> 24;
-            uint32_t mant = bits & 0x00FFFFFF;
-            memset(target, 0, 32);
-            if (exp <= 32) {
-                target[31 - exp] = (mant >> 16) & 0xFF;
-                target[30 - exp] = (mant >> 8) & 0xFF;
-                target[29 - exp] = mant & 0xFF;
-            }
+        // Tính target
+        uint32_t bits;
+        memcpy(&bits, header + 72, 4);
+        bits = __builtin_bswap32(bits);
+        uint32_t exp = bits >> 24;
+        uint32_t mant = bits & 0x00FFFFFF;
+        memset(target, 0, 32);
+        if (exp <= 32) {
+            target[31 - exp] = (mant >> 16) & 0xFF;
+            target[30 - exp] = (mant >> 8) & 0xFF;
+            target[29 - exp] = mant & 0xFF;
         }
 
-        // Phân chia nonce range
+        // Chia nonce range
         uint32_t startNonce, endNonce;
         uint64_t totalNonces = 1ULL << 32;
         uint64_t noncesPerThread = totalNonces / numThreads;
@@ -443,14 +429,10 @@ void minerThread(int threadId) {
 
         for (nonce = startNonce; nonce <= endNonce && !solutionFound && !shouldStopMining; ++nonce) {
             memcpy(header + 76, &nonce, 4);
-            // Double SHA256
-            uint8_t firstHash[32];
-            sha.hashBlockHeader(header, firstHash); // Giả sử DSHA2.h có hashBlockHeader(in, out)
-            sha.hashBlockHeader(firstHash, hash);
-
+            sha.hashBlockHeader(header, hash);   // double SHA256 luôn
             totalHashes.fetch_add(1, std::memory_order_relaxed);
 
-            // So sánh với target (big-endian so sánh từ cuối)
+            // check target
             bool valid = true;
             for (int i = 31; i >= 0; i--) {
                 if (hash[i] < target[i]) break;
@@ -463,14 +445,14 @@ void minerThread(int threadId) {
                     bestNonce = nonce;
                     memcpy(bestHash, hash, 32);
                     std::cout << "🏆 BLOCK FOUND by thread " << threadId
-                              << "! Nonce: 0x" << std::hex << nonce << std::dec << std::endl;
-                    // Submit (sẽ được xử lý ở main thread)
+                              << "! Nonce: 0x" << std::hex << nonce << std::dec
+                              << ", extranonce2: " << localExtranonce2 << std::endl;
+                    // Submit sẽ được main thread gọi
                 }
                 break;
             }
         }
 
-        // Nếu không tìm thấy và chưa hết range, yêu cầu job mới
         if (!solutionFound && !shouldStopMining)
             jobReceived = false;
     }
@@ -559,14 +541,10 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         if (solutionFound) {
-            // Lấy extranonce2 đã dùng (cần lưu lại, ở đây ta lấy từ thread, nhưng đơn giản hóa: gửi submit với extranonce2 ứng với nonce đã tìm)
-            // Trong minerThread, extranonce2 được tạo từ counter, ta cần lưu lại lúc tìm thấy.
-            // Đơn giản: ta gọi submit với extranonce2 rỗng và để pool tự xác nhận? Không, phải gửi đúng.
-            // Để đơn giản, ta sử dụng biến lưu extranonce2 lúc tìm thấy, hoặc tính lại.
-            // Trong code này, mỗi thread dùng extranonce2 riêng. Khi tìm thấy, ta không có sẵn extranonce2. 
-            // Ta sửa: khi solutionFound=true, ta sẽ gọi một hàm submit từ main thread với nonce và extranonce2 đã được lưu.
-            // Bạn có thể cải tiến: thêm biến lưu extranonce2 lúc submit.
-            std::cout << "⚠️ Submit not fully implemented, exiting" << std::endl;
+            // Lấy extranonce2 từ biến lưu (cần thêm cơ chế lưu)
+            // Ở đây ta tạm dùng extranonce2_counter-1 vì solutionFound set khi extranonce2_counter đã tăng
+            // Đơn giản ta dùng một biến toàn cục lưu lúc tìm thấy.
+            std::cout << "⚠️ Submit not fully implemented (need extranonce2), exiting" << std::endl;
             exit(0);
         }
 
