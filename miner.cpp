@@ -40,16 +40,14 @@ struct BlockHeader {
     uint32_t nonce;
 };
 
-// ==================== HÀM BĂM SHA256 KÉP ====================
 DSHA256 sha;
 
-// ==================== THAM SỐ NGƯỜI DÙNG ====================
+// ==================== THAM SỐ ====================
 std::string poolHost = "public-pool.io";
 int poolPort = 3333;
 std::string btcAddress;
 std::string walletName = "CPUMiner";
 
-// Danh sách pool dự phòng
 struct PoolInfo {
     std::string host;
     int port;
@@ -63,7 +61,7 @@ std::vector<PoolInfo> backupPools = {
 };
 int currentPoolIndex = 0;
 
-// ==================== TRẠNG THÁI STRATUM ====================
+// ==================== TRẠNG THÁI ====================
 std::string jobId;
 uint8_t header[80];
 uint8_t target[32];
@@ -84,7 +82,7 @@ steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
 
-// ==================== WEBSOCKET CLIENT (WS + WSS) ====================
+// ==================== WEBSOCKET CLIENT ====================
 using ws_stream = websocket::stream<tcp::socket>;
 using wss_stream = websocket::stream<beast::ssl_stream<tcp::socket>>;
 
@@ -145,6 +143,13 @@ private:
             auto const results = resolver_.resolve(host_, port_);
             if (useSSL_) {
                 auto& wss = std::get<wss_stream>(ws_);
+                // Thêm handshake headers
+                wss.set_option(websocket::stream_base::decorator(
+                    [](websocket::request_type& req) {
+                        req.set(beast::http::field::user_agent, "BTC-Miner/1.0");
+                        req.set(beast::http::field::origin, "https://localhost");
+                    }
+                ));
                 auto& ssl_layer = wss.next_layer();
                 auto ep = net::connect(beast::get_lowest_layer(wss), results);
                 if (!SSL_set_tlsext_host_name(ssl_layer.native_handle(), host_.c_str()))
@@ -156,6 +161,13 @@ private:
                 readLoop(wss);
             } else {
                 auto& ws = std::get<ws_stream>(ws_);
+                // Thêm handshake headers
+                ws.set_option(websocket::stream_base::decorator(
+                    [](websocket::request_type& req) {
+                        req.set(beast::http::field::user_agent, "BTC-Miner/1.0");
+                        req.set(beast::http::field::origin, "http://localhost");
+                    }
+                ));
                 auto ep = net::connect(ws.next_layer(), results);
                 ws.handshake(host_ + ":" + std::to_string(ep.port()), "/");
                 std::cout << "✅ Connected (WS) to " << host_ << ":" << ep.port() << std::endl;
@@ -191,7 +203,7 @@ private:
 
 std::unique_ptr<StratumClient> wsClient;
 
-// ==================== TIỆN ÍCH HEX / BYTE ====================
+// ==================== HEX/BYTE HELPERS ====================
 uint8_t hexToByte(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -219,7 +231,7 @@ bool checkTarget(const uint8_t* hash) {
     return false;
 }
 
-// ==================== GIAO THỨC STRATUM ====================
+// ==================== STRATUM ====================
 void stratumSend(const std::string& jsonStr) {
     if (wsClient) wsClient->send(jsonStr);
 }
@@ -254,7 +266,7 @@ void stratumSubmit(uint32_t nonce) {
     stratumSend(req.dump());
 }
 
-// ==================== XỬ LÝ TIN NHẮN POOL ====================
+// ==================== XỬ LÝ TIN NHẮN ====================
 void onWsMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
@@ -338,7 +350,7 @@ void onWsDisconnect() {
     shouldStopMining = true;
 }
 
-// ==================== KẾT NỐI POOL ====================
+// ==================== KẾT NỐI ====================
 void stratumConnect() {
     if (btcAddress.empty()) {
         std::cerr << "⚠️ BTC address not set!" << std::endl;
@@ -358,7 +370,7 @@ void stratumConnect() {
     wsClient->connect(poolHost, std::to_string(poolPort), useSSL);
 }
 
-// ==================== LUỒNG ĐÀO ====================
+// ==================== MINING ====================
 void minerThread(int threadId) {
     BlockHeader localHeader;
     uint8_t hash[32];
@@ -410,7 +422,7 @@ void minerThread(int threadId) {
     }
 }
 
-// ==================== BÁO CÁO HASHRATE ====================
+// ==================== BÁO CÁO ====================
 void reportStats() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -430,7 +442,7 @@ void reportStats() {
     }
 }
 
-// ==================== THOÁT AN TOÀN ====================
+// ==================== MAIN ====================
 std::atomic<bool> exitFlag{false};
 void signalHandler(int) {
     exitFlag = true;
@@ -438,7 +450,6 @@ void signalHandler(int) {
     if (wsClient) wsClient->stop();
 }
 
-// ==================== MAIN ====================
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
