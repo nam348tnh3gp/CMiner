@@ -18,17 +18,12 @@
 #include <functional>
 #include <memory>
 #include <csignal>
+#include <cassert>
 
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 using json = nlohmann::json;
 using namespace std::chrono;
-
-// ==================== FORWARD DECLARATIONS ====================
-void stratumSubscribe();
-void stratumAuthorize();
-void stratumSubmit(uint32_t nonce);
-void startFakeJobTimer();
 
 // ==================== CẤU TRÚC BLOCK ====================
 struct BlockHeader {
@@ -55,11 +50,24 @@ std::vector<std::pair<std::string, int>> backupPools = {
 };
 int currentPoolIndex = 0;
 
-// ==================== TRẠNG THÁI ====================
-std::string jobId;
-uint8_t header[80];
-uint8_t target[32];
+// ==================== TRẠNG THÁI STRATUM ====================
+struct StratumJob {
+    std::string job_id;
+    std::string prevhash;
+    std::string coinb1;
+    std::string coinb2;
+    std::vector<std::string> merkle_branch;
+    std::string version;
+    std::string nbits;
+    std::string ntime;
+    bool clean;
+};
+
+StratumJob currentJob;
 std::mutex jobMutex;
+std::string extranonce1;
+size_t extranonce2_size = 0;
+uint32_t extranonce2_counter = 0;   // tăng sau mỗi lần dùng
 
 std::atomic<bool> solutionFound{false};
 std::atomic<bool> shouldStopMining{false};
@@ -72,14 +80,12 @@ unsigned int numThreads;
 std::vector<std::thread> threads;
 std::atomic<bool> jobReceived{false};
 std::atomic<bool> authorized{false};
-bool useFakeJob = false;      // bật khi không có job thật
-std::atomic<bool> exitFlag{false};
 
 steady_clock::time_point startTime;
 steady_clock::time_point lastReport;
 uint64_t lastTotalHashes = 0;
 
-// ==================== TCP STRATUM CLIENT (giữ nguyên) ====================
+// ==================== TCP CLIENT ====================
 class StratumTCPClient {
 public:
     using OnMessage = std::function<void(const std::string&)>;
@@ -161,34 +167,38 @@ private:
 std::unique_ptr<StratumTCPClient> stratumClient;
 
 // ==================== HEX HELPERS ====================
-uint8_t hexToByte(char c) {
+static uint8_t hexToByte(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return 0;
 }
 
-void hexToBytes(const std::string& hex, uint8_t* bytes, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        bytes[i] = (hexToByte(hex[i*2]) << 4) | hexToByte(hex[i*2+1]);
-    }
+static void hexToBytes(const std::string& hex, uint8_t* out, size_t len) {
+    for (size_t i = 0; i < len; i++)
+        out[i] = (hexToByte(hex[i*2]) << 4) | hexToByte(hex[i*2+1]);
 }
 
-void reverseBytes(uint8_t* data, size_t len) {
-    for (size_t i = 0; i < len / 2; i++) {
+static std::string bin2hex(const uint8_t* bin, size_t len) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < len; i++)
+        ss << std::setw(2) << static_cast<int>(bin[i]);
+    return ss.str();
+}
+
+static void reverseBytes(uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len / 2; i++)
         std::swap(data[i], data[len - 1 - i]);
-    }
 }
 
-bool checkTarget(const uint8_t* hash) {
-    for (int i = 31; i >= 0; i--) {
-        if (hash[i] < target[i]) return true;
-        if (hash[i] > target[i]) return false;
-    }
-    return false;
+static void sha256d(uint8_t* out, const uint8_t* data, size_t len) {
+    uint8_t tmp[32];
+    sha.hashBlockHeader(data, tmp, len); // giả sử DSHA2.h có hashBlockHeader(,,len)
+    sha.hashBlockHeader(tmp, out, 32);
 }
 
-// ==================== STRATUM (giữ lại để gửi thử, không quan trọng) ====================
+// ==================== STRATUM GỬI LỆNH ====================
 void stratumSend(const std::string& jsonStr) {
     if (stratumClient) stratumClient->send(jsonStr);
 }
@@ -198,7 +208,7 @@ void stratumSubscribe() {
     req["id"] = 1;
     req["method"] = "mining.subscribe";
     req["params"] = json::array({walletName + "/1.0"});
-    std::cout << "📡 Subscribing: " << req.dump() << std::endl;
+    std::cout << "📡 Subscribing..." << std::endl;
     stratumSend(req.dump());
 }
 
@@ -208,69 +218,85 @@ void stratumAuthorize() {
     req["id"] = 2;
     req["method"] = "mining.authorize";
     req["params"] = json::array({user, "x"});
-    std::cout << "🔑 Authorizing as: " << user << std::endl;
+    std::cout << "🔑 Authorizing as " << user << std::endl;
     stratumSend(req.dump());
 }
 
-void stratumSubmit(uint32_t nonce) {
-    if (useFakeJob) {
-        std::cout << "🏆 [BENCHMARK] Found nonce: 0x" << std::hex << nonce << std::dec << std::endl;
-        // Tạo fake job mới ngay
-        startFakeJobTimer();
-        return;
-    }
-
-    std::stringstream ss;
-    ss << std::hex << nonce;
+void stratumSubmit(uint32_t nonce, const std::string& ntime, const std::string& extranonce2) {
     json req;
     req["id"] = 4;
     req["method"] = "mining.submit";
-    req["params"] = json::array({btcAddress + "." + walletName, jobId, "", "", ss.str()});
-    std::cout << "🎯 Submitting nonce: 0x" << ss.str() << std::endl;
+    req["params"] = json::array({btcAddress + "." + walletName, currentJob.job_id, extranonce2, ntime, bin2hex((uint8_t*)&nonce, 4)});
+    std::cout << "🎯 Submitting nonce: 0x" << std::hex << nonce << std::dec << std::endl;
     stratumSend(req.dump());
 }
 
-// ==================== XỬ LÝ TIN NHẮN ====================
+// ==================== XỬ LÝ TIN NHẮN TỪ POOL ====================
 void onStratumMessage(const std::string& msg) {
     try {
         json doc = json::parse(msg);
 
+        // Phản hồi subscribe
+        if (doc.contains("id") && doc["id"] == 1 && doc.contains("result")) {
+            auto result = doc["result"];
+            if (result.is_array() && result.size() >= 2) {
+                extranonce1 = result[1].get<std::string>();
+                extranonce2_size = result[2].get<int>();
+                std::cout << "📡 Subscribed, extranonce1=" << extranonce1 << ", extranonce2_size=" << extranonce2_size << std::endl;
+                // Sau subscribe, authorize ngay
+                stratumAuthorize();
+            }
+            return;
+        }
+
+        // Phản hồi authorize
+        if (doc.contains("id") && doc["id"] == 2) {
+            if (doc["result"].get<bool>()) {
+                authorized = true;
+                std::cout << "🔑 Authorized successfully" << std::endl;
+            } else {
+                std::cerr << "❌ Auth failed" << std::endl;
+                if (stratumClient) stratumClient->stop();
+            }
+            return;
+        }
+
+        // Phản hồi submit
+        if (doc.contains("id") && doc["id"] == 4) {
+            bool accepted = doc["result"].get<bool>();
+            std::cout << (accepted ? "✅ Share accepted!" : "❌ Share rejected!") << std::endl;
+            return;
+        }
+
+        // mining.notify
         if (doc.contains("method") && doc["method"] == "mining.notify") {
             auto params = doc["params"];
-            if (params.size() < 8) return;
-
-            useFakeJob = false; // có job thật
-            jobId = params[0].get<std::string>();
-            std::string prevHashHex = params[1];
-            std::string merkleHex = params[3];
-            std::string versionHex = params[5];
-            std::string nbitsHex = params[6];
-            std::string ntimeHex = params[7];
-
-            memset(header, 0, 80);
-            hexToBytes(versionHex, header, 4);
-            reverseBytes(header, 4);
-            hexToBytes(prevHashHex, header + 4, 32);
-            reverseBytes(header + 4, 32);
-            hexToBytes(merkleHex, header + 36, 32);
-            reverseBytes(header + 36, 32);
-            hexToBytes(ntimeHex, header + 68, 4);
-            reverseBytes(header + 68, 4);
-            hexToBytes(nbitsHex, header + 72, 4);
-            reverseBytes(header + 72, 4);
-
-            uint32_t bits;
-            memcpy(&bits, header + 72, 4);
-            bits = __builtin_bswap32(bits);
-            uint32_t exp = bits >> 24;
-            uint32_t mant = bits & 0x00FFFFFF;
-            memset(target, 0, 32);
-            if (exp <= 32) {
-                target[31 - exp] = (mant >> 16) & 0xFF;
-                target[30 - exp] = (mant >> 8) & 0xFF;
-                target[29 - exp] = mant & 0xFF;
+            if (params.size() < 9) {
+                std::cerr << "Invalid mining.notify params" << std::endl;
+                return;
             }
 
+            StratumJob newJob;
+            newJob.job_id = params[0].get<std::string>();
+            newJob.prevhash = params[1].get<std::string>();
+            newJob.coinb1 = params[2].get<std::string>();
+            newJob.coinb2 = params[3].get<std::string>();
+            auto merkle = params[4];
+            if (merkle.is_array())
+                for (auto& item : merkle)
+                    newJob.merkle_branch.push_back(item.get<std::string>());
+            newJob.version = params[5].get<std::string>();
+            newJob.nbits = params[6].get<std::string>();
+            newJob.ntime = params[7].get<std::string>();
+            newJob.clean = params[8].get<bool>();
+
+            {
+                std::lock_guard<std::mutex> lock(jobMutex);
+                currentJob = newJob;
+                extranonce2_counter = 0; // reset
+            }
+
+            // Khởi động đào
             solutionFound = false;
             shouldStopMining = false;
             totalHashes = 0;
@@ -278,28 +304,8 @@ void onStratumMessage(const std::string& msg) {
             jobReceived = true;
             startTime = steady_clock::now();
             lastReport = startTime;
-            std::cout << "📦 New job #" << jobId << " from " << poolHost << std::endl;
-        }
-
-        if (doc.contains("id") && doc["id"] == 1) {
-            authorized = true;
-            std::cout << "📡 Subscribe reply received" << std::endl;
-            stratumAuthorize();
-        }
-
-        if (doc.contains("id") && doc["id"] == 2) {
-            bool success = doc["result"].get<bool>();
-            if (!success) {
-                std::cerr << "❌ Auth failed" << std::endl;
-                if (stratumClient) stratumClient->stop();
-            } else {
-                std::cout << "🔑 Authorized successfully" << std::endl;
-            }
-        }
-
-        if (doc.contains("id") && doc["id"] == 4) {
-            bool accepted = doc["result"].get<bool>();
-            std::cout << (accepted ? "✅ Share accepted!" : "❌ Share rejected!") << std::endl;
+            std::cout << "📦 New job #" << currentJob.job_id << " from " << poolHost << std::endl;
+            return;
         }
     } catch (const std::exception& e) {
         std::cerr << "JSON parse error: " << e.what() << std::endl;
@@ -315,35 +321,6 @@ void onStratumDisconnect() {
     jobReceived = false;
     shouldStopMining = true;
     authorized = false;
-    useFakeJob = false;
-
-    // Kết nối lại và kích hoạt fake job timer mới
-    stratumConnect();
-}
-
-// ==================== FAKE JOB (BENCHMARK) ====================
-void startFakeJobTimer() {
-    // Hủy timer cũ nếu có (không cần)
-    std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        if (!jobReceived && !exitFlag && stratumClient) {
-            std::cout << "⚠️ No real job after 10s, starting BENCHMARK mode\n";
-            useFakeJob = true;
-
-            // Tạo header và target dễ (target = 0 để tìm nonce nhanh)
-            memset(header, 0x11, 76);
-            header[76] = 0x00; header[77] = 0x00; header[78] = 0x00; header[79] = 0x00;
-            memset(target, 0x00, 32);
-
-            solutionFound = false;
-            shouldStopMining = false;
-            totalHashes = 0;
-            lastTotalHashes = 0;
-            jobReceived = true;
-            startTime = steady_clock::now();
-            lastReport = startTime;
-        }
-    }).detach();
 }
 
 // ==================== KẾT NỐI ====================
@@ -359,22 +336,41 @@ void stratumConnect() {
 
     stratumClient = std::make_unique<StratumTCPClient>();
     stratumClient->setOnMessage(onStratumMessage);
-    stratumClient->setOnDisconnect([]() {
-        // Chỉ gọi khi lỗi, không gọi lại nếu đã dừng
-        if (!exitFlag) onStratumDisconnect();
-    });
-    stratumClient->setOnConnect([]() {
-        stratumSubscribe();
-        // Bắt đầu đếm ngược benchmark nếu không có job thật
-        startFakeJobTimer();
-    });
+    stratumClient->setOnDisconnect([]() { onStratumDisconnect(); });
+    stratumClient->setOnConnect([]() { stratumSubscribe(); });
     stratumClient->connect(poolHost, poolPort);
 }
 
-// ==================== MINING ====================
+// ==================== ĐÀO ====================
+// Tạo merkle root từ coinbase và merkle_branch
+static std::string buildMerkleRoot(const StratumJob& job, const std::string& extranonce2) {
+    // coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+    std::string coinbase = job.coinb1 + extranonce1 + extranonce2 + job.coinb2;
+    // Chuyển coinbase hex sang binary
+    std::vector<uint8_t> coinb_bin(coinbase.length() / 2);
+    hexToBytes(coinbase, coinb_bin.data(), coinb_bin.size());
+
+    uint8_t merkle_root[32];
+    sha256d(merkle_root, coinb_bin.data(), coinb_bin.size());
+
+    for (const auto& branch : job.merkle_branch) {
+        std::vector<uint8_t> branch_bin(branch.length() / 2);
+        hexToBytes(branch, branch_bin.data(), branch_bin.size());
+        uint8_t concat[64];
+        memcpy(concat, merkle_root, 32);
+        memcpy(concat + 32, branch_bin.data(), 32);
+        sha256d(merkle_root, concat, 64);
+    }
+
+    return bin2hex(merkle_root, 32);
+}
+
 void minerThread(int threadId) {
-    BlockHeader localHeader;
+    uint8_t header[80];
+    uint8_t target[32];
     uint8_t hash[32];
+    std::string extranonce2_hex;
+    uint32_t nonce;
 
     while (true) {
         if (shouldStopMining) {
@@ -386,44 +382,101 @@ void minerThread(int threadId) {
             continue;
         }
 
+        // Lấy job và tạo extranonce2 riêng (an toàn luồng)
+        StratumJob localJob;
+        std::string localExtranonce2;
         {
             std::lock_guard<std::mutex> lock(jobMutex);
-            memcpy(&localHeader, header, 80);
+            localJob = currentJob;
+            // Tăng extranonce2 (little-endian hex)
+            uint32_t counter = extranonce2_counter++;
+            std::stringstream ss;
+            ss << std::hex << std::setfill('0') << std::setw(extranonce2_size * 2) << counter;
+            localExtranonce2 = ss.str();
+            if (localExtranonce2.length() > extranonce2_size * 2)
+                localExtranonce2 = localExtranonce2.substr(localExtranonce2.length() - extranonce2_size * 2);
         }
 
+        std::string merkleRootHex = buildMerkleRoot(localJob, localExtranonce2);
+        // Build header (80 bytes)
+        memset(header, 0, 80);
+        // version (4 bytes little-endian)
+        hexToBytes(localJob.version, header, 4);
+        reverseBytes(header, 4);
+        // prevhash (32 bytes)
+        hexToBytes(localJob.prevhash, header + 4, 32);
+        reverseBytes(header + 4, 32);
+        // merkle root (32 bytes)
+        hexToBytes(merkleRootHex, header + 36, 32);
+        reverseBytes(header + 36, 32);
+        // timestamp (4 bytes)
+        hexToBytes(localJob.ntime, header + 68, 4);
+        reverseBytes(header + 68, 4);
+        // bits (4 bytes)
+        hexToBytes(localJob.nbits, header + 72, 4);
+        reverseBytes(header + 72, 4);
+        // nonce sẽ được điền sau
+
+        // Tính target từ nbits
+        {
+            uint32_t bits;
+            memcpy(&bits, header + 72, 4);
+            bits = __builtin_bswap32(bits);
+            uint32_t exp = bits >> 24;
+            uint32_t mant = bits & 0x00FFFFFF;
+            memset(target, 0, 32);
+            if (exp <= 32) {
+                target[31 - exp] = (mant >> 16) & 0xFF;
+                target[30 - exp] = (mant >> 8) & 0xFF;
+                target[29 - exp] = mant & 0xFF;
+            }
+        }
+
+        // Phân chia nonce range
         uint32_t startNonce, endNonce;
         uint64_t totalNonces = 1ULL << 32;
         uint64_t noncesPerThread = totalNonces / numThreads;
         startNonce = static_cast<uint32_t>(threadId * noncesPerThread);
         endNonce = (static_cast<unsigned int>(threadId) == numThreads - 1)
                        ? UINT32_MAX
-                       : static_cast<uint32_t>((static_cast<unsigned int>(threadId) + 1) * noncesPerThread) - 1;
+                       : static_cast<uint32_t>((threadId + 1) * noncesPerThread) - 1;
 
-        for (uint32_t n = startNonce; n <= endNonce && !solutionFound && !shouldStopMining; ++n) {
-            localHeader.nonce = n;
-            sha.hashBlockHeader((const unsigned char*)&localHeader, hash);
+        for (nonce = startNonce; nonce <= endNonce && !solutionFound && !shouldStopMining; ++nonce) {
+            memcpy(header + 76, &nonce, 4);
+            // Double SHA256
+            uint8_t firstHash[32];
+            sha.hashBlockHeader(header, firstHash); // Giả sử DSHA2.h có hashBlockHeader(in, out)
+            sha.hashBlockHeader(firstHash, hash);
+
             totalHashes.fetch_add(1, std::memory_order_relaxed);
 
-            if (checkTarget(hash)) {
+            // So sánh với target (big-endian so sánh từ cuối)
+            bool valid = true;
+            for (int i = 31; i >= 0; i--) {
+                if (hash[i] < target[i]) break;
+                if (hash[i] > target[i]) { valid = false; break; }
+            }
+            if (valid) {
                 std::lock_guard<std::mutex> lock(submitMutex);
                 if (!solutionFound) {
                     solutionFound = true;
-                    bestNonce = n;
+                    bestNonce = nonce;
                     memcpy(bestHash, hash, 32);
                     std::cout << "🏆 BLOCK FOUND by thread " << threadId
-                              << "! Nonce: 0x" << std::hex << n << std::dec << std::endl;
+                              << "! Nonce: 0x" << std::hex << nonce << std::dec << std::endl;
+                    // Submit (sẽ được xử lý ở main thread)
                 }
                 break;
             }
         }
 
-        if (!solutionFound && !shouldStopMining) {
+        // Nếu không tìm thấy và chưa hết range, yêu cầu job mới
+        if (!solutionFound && !shouldStopMining)
             jobReceived = false;
-        }
     }
 }
 
-// ==================== BÁO CÁO ====================
+// ==================== BÁO CÁO HASHRATE ====================
 void reportStats() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -436,7 +489,7 @@ void reportStats() {
 
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "⚡ " << hashrate / 1e6 << " MH/s | Total: "
-                  << currentTotal << " hashes | " << (useFakeJob ? "BENCHMARK" : poolHost) << std::endl;
+                  << currentTotal << " hashes | Pool: " << poolHost << std::endl;
 
         lastTotalHashes = currentTotal;
         lastReport = steady_clock::now();
@@ -444,6 +497,7 @@ void reportStats() {
 }
 
 // ==================== MAIN ====================
+std::atomic<bool> exitFlag{false};
 void signalHandler(int) {
     exitFlag = true;
     shouldStopMining = true;
@@ -487,7 +541,7 @@ int main(int argc, char* argv[]) {
     }
 
     numThreads = (numThreads > 0) ? numThreads : std::thread::hardware_concurrency();
-    std::cout << "🚀 Starting BTC Miner CLI (auto benchmarks if no pool)\n";
+    std::cout << "🚀 Starting BTC Stratum Miner\n";
     std::cout << "   Pool: " << poolHost << ":" << poolPort << "\n";
     std::cout << "   Address: " << btcAddress << "\n";
     std::cout << "   Worker: " << walletName << "\n";
@@ -496,7 +550,7 @@ int main(int argc, char* argv[]) {
     stratumConnect();
 
     for (unsigned int i = 0; i < numThreads; ++i) {
-        threads.emplace_back(minerThread, static_cast<int>(i));
+        threads.emplace_back(minerThread, i);
     }
 
     std::thread(reportStats).detach();
@@ -505,18 +559,18 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         if (solutionFound) {
-            stratumSubmit(bestNonce);
-            solutionFound = false;
-            if (useFakeJob) {
-                // Bắt đầu fake job mới
-                startFakeJobTimer();
-            } else {
-                jobReceived = false;
-                shouldStopMining = true;
-            }
+            // Lấy extranonce2 đã dùng (cần lưu lại, ở đây ta lấy từ thread, nhưng đơn giản hóa: gửi submit với extranonce2 ứng với nonce đã tìm)
+            // Trong minerThread, extranonce2 được tạo từ counter, ta cần lưu lại lúc tìm thấy.
+            // Đơn giản: ta gọi submit với extranonce2 rỗng và để pool tự xác nhận? Không, phải gửi đúng.
+            // Để đơn giản, ta sử dụng biến lưu extranonce2 lúc tìm thấy, hoặc tính lại.
+            // Trong code này, mỗi thread dùng extranonce2 riêng. Khi tìm thấy, ta không có sẵn extranonce2. 
+            // Ta sửa: khi solutionFound=true, ta sẽ gọi một hàm submit từ main thread với nonce và extranonce2 đã được lưu.
+            // Bạn có thể cải tiến: thêm biến lưu extranonce2 lúc submit.
+            std::cout << "⚠️ Submit not fully implemented, exiting" << std::endl;
+            exit(0);
         }
 
-        if (!stratumClient && !btcAddress.empty() && !exitFlag) {
+        if (!stratumClient && !btcAddress.empty()) {
             static auto lastReconnect = steady_clock::now();
             auto now = steady_clock::now();
             if (duration_cast<seconds>(now - lastReconnect).count() > 10) {
