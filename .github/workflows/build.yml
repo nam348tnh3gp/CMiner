@@ -9,6 +9,8 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -16,12 +18,76 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libboost-system-dev libssl-dev nlohmann-json3-dev
+          sudo apt-get install -y \
+            g++ \
+            make \
+            libboost-system-dev \
+            libboost-thread-dev \
+            libssl-dev \
+            nlohmann-json3-dev
+          g++ --version
 
       - name: Build project
-        run: make
+        run: |
+          make clean 2>/dev/null || true
+          make
+          echo "✅ Build successful"
+          ls -la miner
 
-      - name: Run miner for 45 seconds
-        # Dùng timeout để chạy 45s, || true đảm bảo job không bị lỗi nếu timeout dừng
-        run: timeout 45 ./miner -a bc1qmej6jqcsrgu6w9dq2yqajhtff0hmnmhn35sj5h || true
-        # Lưu ý: nếu pool không kết nối được, miner sẽ thử reconnect, nhưng job vẫn pass
+      - name: Run miner test on unMineable (45 seconds)
+        env:
+          # Thay địa chỉ ví của bạn vào đây
+          WALLET_ADDRESS: "nano_3k41y61xxgmre13exyk3q69k78bxxwhmrmncezt49jg1sok18xo64jeff5hk"
+        run: |
+          echo "🔄 Testing miner with unMineable pool..."
+          echo "   Pool: sha256.unmineable.com:3333"
+          echo "   Worker: XNO:${WALLET_ADDRESS}.github_worker"
+          
+          timeout 45 ./miner \
+            -o sha256.unmineable.com \
+            -p 3333 \
+            -a XNO:${WALLET_ADDRESS} \
+            -w github_worker \
+            -t 2 \
+            2>&1 | tee miner.log || {
+            exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+              echo "✅ Test completed (45 seconds timeout)"
+            else
+              echo "⚠️ Miner exited with code $exit_code"
+            fi
+          }
+          
+          echo ""
+          echo "📋 Last 30 lines of log:"
+          tail -30 miner.log
+
+      - name: Check connection status
+        run: |
+          echo "🔍 Checking pool connection..."
+          if grep -qi "authorized successfully\|new job\|share accepted" miner.log; then
+            echo "✅ Successfully connected to unMineable pool!"
+            grep -E "AUTH|JOB|SHARE|STATS" miner.log | tail -10
+          elif grep -qi "auth failed\|unauthorized" miner.log; then
+            echo "⚠️ Auth warning - worker name format may be incorrect"
+            echo "   Expected format: XNO:your_nano_address.worker_name"
+          else
+            echo "ℹ️ Connection test completed (may not have found shares)"
+          fi
+
+      - name: Check for critical errors
+        run: |
+          if grep -qi "segmentation fault\|assertion failed" miner.log; then
+            echo "❌ Critical error detected!"
+            exit 1
+          else
+            echo "✅ No critical errors"
+          fi
+
+      - name: Upload log artifact (if failed)
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: miner-log
+          path: miner.log
+          retention-days: 7
