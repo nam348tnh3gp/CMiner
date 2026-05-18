@@ -30,7 +30,7 @@ public:
     DSHA256 &write(const unsigned char *data, size_t len) {
         size_t bufsize = bytes % 64;
         if (bufsize && bufsize + len >= 64) {
-            std::memcpy(buf + bufsize, data, 64 - bufsize);
+            memcpy(buf + bufsize, data, 64 - bufsize);
             bytes += 64 - bufsize;
             data += 64 - bufsize;
             len  -= 64 - bufsize;
@@ -44,7 +44,7 @@ public:
             len -= 64;
         }
         if (len > 0) {
-            std::memcpy(buf + bufsize, data, len);
+            memcpy(buf + bufsize, data, len);
             bytes += len;
         }
         return *this;
@@ -67,44 +67,30 @@ public:
         return *this;
     }
 
-    // Hash 2 lần cho block header (double SHA-256) – tối ưu cực mạnh
+    // Hash 2 lần cho block header (double SHA-256)
     void hashBlockHeader(const unsigned char header[80], unsigned char hash[OUTPUT_SIZE]) {
-        // Lần hash thứ nhất: dùng luồng bình thường
         reset();
         write(header, 80);
-        finalize(hash);                     // lúc này trong s là trạng thái sau hash đầu
+        finalize(hash);
 
-        // Lần hash thứ hai: thay vì gọi reset/write/finalize đầy đủ
-        // ta tự tạo block padding cho input 32 byte và chạy transform trực tiếp
-        alignas(4) unsigned char block[64];
-        std::memcpy(block, hash, 32);
-        std::memset(block + 32, 0, 32);
-        block[32] = 0x80;
-
-        // Độ dài message = 256 bit → big‑endian 64‑bit ở cuối block
-        writeBE64(block + 56, 256);
-
-        uint32_t state[8];
-        initialize(state);                  // trạng thái khởi đầu của SHA‑256
-        transform(state, block);            // chỉ 1 lần transform
-
-        // Xuất kết quả
-        for (int i = 0; i < 8; i++) {
-            writeBE32(hash + i * 4, state[i]);
-        }
+        unsigned char hash2[OUTPUT_SIZE];
+        reset();
+        write(hash, OUTPUT_SIZE);
+        finalize(hash2);
+        memcpy(hash, hash2, OUTPUT_SIZE);
     }
 
     // Lấy trạng thái (dành cho tối ưu midstate sau này)
     const uint32_t* getState() const { return s; }
     void setState(const uint32_t *state) {
-        std::memcpy(s, state, sizeof(s));
+        memcpy(s, state, sizeof(s));
     }
     uint64_t getBytes() const { return bytes; }
     void setBytes(uint64_t b) { bytes = b; }
 
 private:
-    alignas(4) uint32_t s[8];           // đảm bảo aligned 4 byte
-    alignas(4) unsigned char buf[64];   // tránh chậm do unaligned access
+    uint32_t s[8];
+    unsigned char buf[64];
     uint64_t bytes;
 
     static const uint32_t K[64];
@@ -140,14 +126,14 @@ private:
         s[7] = 0x5be0cd19ul;
     }
 
-    // Transform đầy đủ 64 vòng – thêm __restrict và giữ nguyên unroll
-    void transform(uint32_t * __restrict s, const unsigned char * __restrict chunk) {
+    // Transform đầy đủ 64 vòng (giữ nguyên code unrolled của bạn)
+    void transform(uint32_t *s, const unsigned char *chunk) {
         uint32_t a = s[0], b = s[1], c = s[2], d = s[3];
         uint32_t e = s[4], f = s[5], g = s[6], h = s[7];
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
         uint32_t t1, t2;
 
-        // Đọc message block (Big-Endian) an toàn, không vi phạm strict aliasing
+        // Đọc message block (Big-Endian)
         w0  = readBE32(chunk + 0);
         w1  = readBE32(chunk + 4);
         w2  = readBE32(chunk + 8);
@@ -165,7 +151,7 @@ private:
         w14 = readBE32(chunk + 56);
         w15 = readBE32(chunk + 60);
 
-        // Vòng 0-63 (giữ nguyên code unrolled của bạn, đã rất nhanh)
+        // Vòng 0-15 (code unrolled gốc của bạn)
         // Vòng 0
         t1 = h + Sigma1(e) + Ch(e,f,g) + K[0] + w0;
         t2 = Sigma0(a) + Maj(a,b,c);
@@ -247,6 +233,7 @@ private:
         h = g; g = f; f = e; e = d + t1;
         d = c; c = b; b = a; a = t1 + t2;
 
+        // Vòng 16-63 (code unrolled gốc của bạn)
         // Vòng 16
         w0  = sigma1(w14) + w9  + sigma0(w1)  + w0;
         t1 = h + Sigma1(e) + Ch(e,f,g) + K[16] + w0;
@@ -542,19 +529,14 @@ private:
         s[4] += e; s[5] += f; s[6] += g; s[7] += h;
     }
 
-    // Đọc/ghi an toàn, không vi phạm strict aliasing, tận dụng builtin
     static inline uint32_t readBE32(const unsigned char *ptr) {
-        uint32_t val;
-        __builtin_memcpy(&val, ptr, sizeof(val));
-        return __builtin_bswap32(val);
+        return __builtin_bswap32(*(uint32_t *)ptr);
     }
     static inline void writeBE32(unsigned char *ptr, uint32_t x) {
-        uint32_t val = __builtin_bswap32(x);
-        __builtin_memcpy(ptr, &val, sizeof(val));
+        *(uint32_t *)ptr = __builtin_bswap32(x);
     }
     static inline void writeBE64(unsigned char *ptr, uint64_t x) {
-        uint64_t val = __builtin_bswap64(x);
-        __builtin_memcpy(ptr, &val, sizeof(val));
+        *(uint64_t *)ptr = __builtin_bswap64(x);
     }
 };
 
