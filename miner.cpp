@@ -171,13 +171,18 @@ static void updateWorkFromRawJob(const RawJob& job) {
     std::cout << "[JOB] New work #" << newWork.jobId << " diff=" << newWork.difficulty << "\n";
 }
 
-// --------------------- GỬI TIN NHẮN ---------------------
+// --------------------- GỬI TIN NHẮN (BÂY GIỜ POST QUA IO_CONTEXT) ---------------------
 static void sendStratum(const std::string& msg) {
-    if (!g_socket || !g_socket->is_open()) return;
-    try {
-        asio::write(*g_socket, asio::buffer(msg + "\n"));
-    } catch (...) {}
+    if (!g_ioc) return;
+    // Post công việc gửi vào io_context để chạy trên luồng ioThread
+    asio::post(*g_ioc, [msg]() {
+        if (!g_socket || !g_socket->is_open()) return;
+        try {
+            asio::write(*g_socket, asio::buffer(msg + "\n"));
+        } catch (...) {}
+    });
 }
+
 static void sendSubscribe() {
     json req; req["id"] = 1; req["method"] = "mining.subscribe"; req["params"] = {"cpuminer/2.0.0"};
     sendStratum(req.dump()); std::cout << "[STRATUM] Subscribe sent\n";
@@ -253,7 +258,7 @@ static void processStratumMessage(const std::string& line) {
     }
 }
 
-// --------------------- PING HANDLER (FIX LỖI LAMBDA) ---------------------
+// --------------------- PING HANDLER (ASYNC) ---------------------
 static void pingHandler(const boost::system::error_code& ec) {
     if (!ec && !g_stop && g_socket && g_socket->is_open()) {
         sendPing();
@@ -264,7 +269,25 @@ static void pingHandler(const boost::system::error_code& ec) {
     }
 }
 
-// --------------------- LUỒNG MẠNG ---------------------
+// --------------------- ĐỌC DỮ LIỆU BẤT ĐỒNG BỘ ---------------------
+static void doAsyncRead(std::shared_ptr<asio::streambuf> buf) {
+    asio::async_read_until(*g_socket, *buf, '\n',
+        [buf](const boost::system::error_code& ec, size_t /*length*/) {
+            if (!ec && !g_stop) {
+                std::istream is(buf.get());
+                std::string line;
+                while (std::getline(is, line)) {
+                    if (!line.empty()) processStratumMessage(line);
+                }
+                doAsyncRead(buf); // Đọc tiếp dòng sau
+            } else if (ec != asio::error::operation_aborted) {
+                std::cerr << "[NET] Read error: " << ec.message() << "\n";
+                // Có thể báo lỗi để kết nối lại
+            }
+        });
+}
+
+// --------------------- LUỒNG MẠNG (SỬ DỤNG ASYNC IO) ---------------------
 static void ioThreadFunc() {
     while (!g_stop) {
         try {
@@ -274,23 +297,24 @@ static void ioThreadFunc() {
             g_socket = std::make_unique<tcp::socket>(*g_ioc);
             asio::connect(*g_socket, endpoints);
             std::cout << "[NET] Connected to " << g_poolHost << ":" << g_poolPort << std::endl;
+
             sendSubscribe();
 
             g_pingTimer = std::make_unique<asio::steady_timer>(*g_ioc);
             g_pingTimer->expires_after(seconds(30));
             g_pingTimer->async_wait(pingHandler);
 
-            asio::streambuf buf;
-            while (!g_stop && g_socket && g_socket->is_open()) {
-                asio::read_until(*g_socket, buf, '\n');
-                std::istream is(&buf);
-                std::string line;
-                while (std::getline(is, line)) if (!line.empty()) processStratumMessage(line);
-            }
+            auto buf = std::make_shared<asio::streambuf>();
+            doAsyncRead(buf);
+
+            g_ioc->run(); // Chạy event loop
+
         } catch (const std::exception& e) {
             std::cerr << "[NET] Error: " << e.what() << ". Reconnecting in 5s...\n";
         }
-        g_socket.reset(); g_pingTimer.reset(); g_ioc.reset();
+        g_socket.reset();
+        g_pingTimer.reset();
+        g_ioc.reset();
         if (!g_stop) std::this_thread::sleep_for(seconds(5));
     }
 }
@@ -313,7 +337,6 @@ static void statsThreadFunc() {
 
 // --------------------- MINER THREAD ---------------------
 static void minerThreadFunc(int threadId) {
-    std::mt19937 rng(threadId + steady_clock::now().time_since_epoch().count());
     DSHA256 shaCtx;
     uint8_t hash[32], header[80];
     uint32_t nonce;
@@ -360,7 +383,7 @@ static void minerThreadFunc(int threadId) {
                                     rawJob.ntime,
                                     binToHex((uint8_t*)&nonce, 4)};
                 sendStratum(submit.dump());
-                std::cout << "[FOUND] Thread " << threadId << " nonce=" << std::hex << nonce << std::dec << "\n";
+                std::cout << "[FOUND] Thread " << threadId << " nonce=0x" << std::hex << nonce << std::dec << "\n";
                 break;
             }
         }
@@ -400,6 +423,7 @@ int main(int argc, char* argv[]) {
         g_minerThreads.emplace_back(minerThreadFunc, i);
 
     while (!g_stop) std::this_thread::sleep_for(milliseconds(100));
+    if (g_ioc) g_ioc->stop(); // Dừng io_context
     g_ioThread.join(); g_statsThread.join();
     for (auto& t : g_minerThreads) t.join();
 
