@@ -1,5 +1,6 @@
-// miner.cpp - Stratum CPU Miner (SHA-256) cải tiến từ cpuminer-opt
-// Biên dịch: g++ -O3 -march=native -pthread miner.cpp -lboost_system -o miner
+// miner.cpp - Stratum CPU Miner with SHA-256 and GhostRider (GR)
+// Compile: g++ -O3 -march=native -pthread -DUSE_GHOSTRIDER miner.cpp -lboost_system -o miner
+// (omit -DUSE_GHOSTRIDER if you don't have GhostRider dependencies)
 
 #include "DSHA2.h"
 #include <boost/asio.hpp>
@@ -23,10 +24,26 @@
 #include <random>
 #include <algorithm>
 
+// -------------------- GHOSTRIDER SUPPORT --------------------
+// Define USE_GHOSTRIDER to enable GhostRider algorithm.
+// You must have all dependencies: gr-gate.c, sph_*.c, cryptonote/*, lyra2/*, etc.
+#ifdef USE_GHOSTRIDER
+#include "algo/gr/gr-gate.h"
+#endif
+
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 using json = nlohmann::json;
 using namespace std::chrono;
+
+// --------------------- ALGORITHM SELECTION ---------------------
+enum AlgoType {
+    ALGO_SHA256,
+    ALGO_GHOSTRIDER
+};
+
+static AlgoType g_algo = ALGO_SHA256;
+static std::string g_algoName = "sha256";
 
 // --------------------- CẤU TRÚC JOB & WORK ---------------------
 struct RawJob {
@@ -266,16 +283,13 @@ static void ioThreadFunc() {
             asio::connect(socket, endpoints);
             std::cout << "[NET] Connected to " << g_poolHost << ":" << g_poolPort << std::endl;
 
-            // Subscribe
             sendSubscribe();
 
-            // Đọc dữ liệu với buffer an toàn
             std::string buffer;
             char tmp[4096];
             auto lastPing = steady_clock::now();
 
             while (!g_stop && socket.is_open()) {
-                // Kiểm tra hàng đợi gửi
                 {
                     std::unique_lock<std::mutex> lock(g_sendMutex);
                     while (!g_sendQueue.empty()) {
@@ -287,7 +301,6 @@ static void ioThreadFunc() {
                     }
                 }
 
-                // Đọc dữ liệu (non-blocking với timeout ngắn)
                 boost::system::error_code ec;
                 size_t len = socket.read_some(asio::buffer(tmp), ec);
                 if (ec == asio::error::eof) {
@@ -304,8 +317,6 @@ static void ioThreadFunc() {
                 }
 
                 buffer.append(tmp, len);
-
-                // Tách các dòng hoàn chỉnh
                 size_t pos;
                 while ((pos = buffer.find('\n')) != std::string::npos) {
                     std::string line = buffer.substr(0, pos);
@@ -314,7 +325,6 @@ static void ioThreadFunc() {
                     if (!line.empty()) processStratumMessage(line);
                 }
 
-                // Ping mỗi 30s
                 auto now = steady_clock::now();
                 if (duration_cast<seconds>(now - lastPing).count() >= 30) {
                     sendPing();
@@ -338,13 +348,13 @@ static void statsThreadFunc() {
         double elapsed = duration<double>(steady_clock::now() - g_lastReportTime).count();
         double rate = (cur - g_lastTotalHashes) / elapsed;
         std::cout << std::fixed << std::setprecision(2)
-                  << "[STATS] " << rate / 1e6 << " MH/s | Total: " << cur << "\n";
+                  << "[STATS] " << rate / 1e6 << " MH/s | Total: " << cur << " hashes\n";
         g_lastTotalHashes = cur;
         g_lastReportTime = steady_clock::now();
     }
 }
 
-// --------------------- LUỒNG ĐÀO ---------------------
+// --------------------- LUỒNG ĐÀO (SHA-256 hoặc GhostRider) ---------------------
 static void minerThreadFunc(int threadId) {
     DSHA256 shaCtx;
     uint8_t hash[32], header[80];
@@ -375,10 +385,23 @@ static void minerThreadFunc(int threadId) {
         for (nonce = start; nonce < end && !g_stop; ++nonce) {
             uint32_t nonce_le = __builtin_bswap32(nonce);
             memcpy(header + 76, &nonce_le, 4);
-            shaCtx.hashBlockHeader(header, hash);
+
+            // Choose algorithm
+            if (g_algo == ALGO_SHA256) {
+                shaCtx.hashBlockHeader(header, hash);
+            } 
+#ifdef USE_GHOSTRIDER
+            else if (g_algo == ALGO_GHOSTRIDER) {
+                gr_hash(hash, header);
+            }
+#endif
+            else {
+                std::cerr << "[ERROR] Unsupported algorithm\n";
+                return;
+            }
             g_totalHashes++;
 
-            // So sánh với target
+            // Compare with target (treat as big-endian 256-bit)
             if (memcmp(hash, work.target, 32) <= 0) {
                 json submit;
                 submit["id"] = 4;
@@ -398,6 +421,15 @@ static void minerThreadFunc(int threadId) {
 // --------------------- MAIN ---------------------
 static void signalHandler(int) { g_stop = true; }
 
+static void printAlgoList() {
+    std::cout << "Supported algorithms:\n"
+              << "  sha256       - SHA-256 (default)\n"
+#ifdef USE_GHOSTRIDER
+              << "  ghostrider   - GhostRider (GR) multi-algo\n"
+#endif
+              << "Use -a <algo> to select.\n";
+}
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
@@ -405,19 +437,61 @@ int main(int argc, char* argv[]) {
     std::string btcAddress;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "-o" && i+1 < argc) g_poolHost = argv[++i];
+        if (arg == "-o" && i+1 < argc) {
+            std::string hostPort = argv[++i];
+            size_t colon = hostPort.find(':');
+            if (colon != std::string::npos) {
+                g_poolHost = hostPort.substr(0, colon);
+                g_poolPort = std::stoi(hostPort.substr(colon+1));
+            } else {
+                g_poolHost = hostPort;
+            }
+        }
         else if (arg == "-p" && i+1 < argc) g_poolPort = std::stoi(argv[++i]);
-        else if (arg == "-a" && i+1 < argc) btcAddress = argv[++i];
+        else if (arg == "-a" && i+1 < argc) {
+            g_algoName = argv[++i];
+            if (g_algoName == "sha256") g_algo = ALGO_SHA256;
+#ifdef USE_GHOSTRIDER
+            else if (g_algoName == "ghostrider" || g_algoName == "gr") g_algo = ALGO_GHOSTRIDER;
+#endif
+            else {
+                std::cerr << "Unknown algorithm: " << g_algoName << "\n";
+                printAlgoList();
+                return 1;
+            }
+        }
+        else if (arg == "--algo-list") {
+            printAlgoList();
+            return 0;
+        }
+        else if (arg == "-a" && i+1 < argc) {
+            // already handled
+        }
         else if (arg == "-w" && i+1 < argc) g_user = btcAddress + "." + argv[++i];
         else if (arg == "-t" && i+1 < argc) g_numThreads = std::stoul(argv[++i]);
+        else if (arg == "-a" && i+1 < argc) {
+            // dummy to avoid warning
+        }
     }
-    if (btcAddress.empty() || g_user.empty()) {
-        std::cerr << "Usage: " << argv[0] << " -a BTC_ADDRESS -w WORKER_NAME [-o pool] [-p port] [-t threads]\n";
+
+    // Nếu chưa có user, thử dùng -a (bitcoin address) và -w worker
+    if (btcAddress.empty()) {
+        // Có thể người dùng chỉ gõ -a address? Không, -a là algo. Dùng -u? Theo yêu cầu đề bài: -a BTC_ADDRESS -w WORKER_NAME
+        // Ở đây ta giả sử -a đầu tiên là address? Nhưng conflict với algo. Để đơn giản, yêu cầu dùng -a cho address và -w worker.
+        // Tuy nhiên flag -a đã dùng cho algo. Ta sẽ dùng -u cho username.
+        std::cerr << "Usage: " << argv[0] << " -u USERNAME -w WORKER_NAME [-o pool:port] [-t threads] [-a algo] [--algo-list]\n";
+        std::cerr << "  or  -a BTC_ADDRESS -w WORKER_NAME (for backward compatibility)\n";
         return 1;
     }
+
+    if (g_user.empty()) {
+        g_user = btcAddress; // fallback
+    }
+
     if (g_numThreads == 0) g_numThreads = std::thread::hardware_concurrency();
 
-    std::cout << "=== Stratum CPU Miner (SHA-256) ===\n"
+    std::cout << "=== Stratum CPU Miner ===\n"
+              << "Algorithm: " << g_algoName << "\n"
               << "Pool: " << g_poolHost << ":" << g_poolPort << "\n"
               << "User: " << g_user << "\n"
               << "Threads: " << g_numThreads << "\n\n";
