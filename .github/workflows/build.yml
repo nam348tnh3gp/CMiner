@@ -20,7 +20,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             g++ \
-            nodejs-lts \
             clang \
             make \
             libboost-system-dev \
