@@ -106,39 +106,36 @@ except ModuleNotFoundError:
           + "python3 -m pip install colorama")
     install("colorama")
 
-# --- CPU INFO FALLBACK FOR IOS ---
-try:
-    from cpuinfo import get_cpu_info
-except ModuleNotFoundError:
-    def get_cpu_info():
-        """
-        Fallback function to get CPU info on platforms where cpuinfo is not available.
-        Tries to use sysctl on darwin (iOS/macOS) or returns a default value.
-        """
-        info = {}
-        try:
-            import subprocess
-            result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], capture_output=True, text=True)
-            if result.returncode == 0 and result.stdout.strip():
-                info['brand_raw'] = result.stdout.strip()
-            else:
-                # Fallback for other platforms (Linux, etc.)
-                try:
-                    with open('/proc/cpuinfo', 'r') as f:
-                        for line in f:
-                            if 'model name' in line:
-                                info['brand_raw'] = line.split(':')[1].strip()
-                                break
-                except FileNotFoundError:
-                    pass
-        except Exception:
-            pass
-        
-        if 'brand_raw' not in info:
-            # If all else fails, use platform information
-            import platform
-            info['brand_raw'] = f"{platform.processor() or platform.machine()} (Unknown)"
-        return info
+# --- CPU INFO FALLBACK FOR IOS (NO cpuinfo) ---
+def get_cpu_info():
+    """
+    Fallback function to get CPU info on platforms where cpuinfo is not available.
+    Tries to use sysctl on darwin (iOS/macOS) or returns a default value.
+    """
+    info = {}
+    try:
+        import subprocess
+        result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            info['brand_raw'] = result.stdout.strip()
+        else:
+            # Fallback for other platforms (Linux, etc.)
+            try:
+                with open('/proc/cpuinfo', 'r') as f:
+                    for line in f:
+                        if 'model name' in line:
+                            info['brand_raw'] = line.split(':')[1].strip()
+                            break
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+    
+    if 'brand_raw' not in info:
+        # If all else fails, use platform information
+        import platform
+        info['brand_raw'] = f"{platform.processor() or platform.machine()} (Unknown)"
+    return info
 
 
 class Settings:
