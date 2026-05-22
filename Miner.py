@@ -864,56 +864,45 @@ class Miner:
                   encoding=Settings.ENCODING) as file:
             lang_file = json.load(file)
 
+        # --- FIXED LANGUAGE SELECTION ---
+        # Luôn có giá trị mặc định an toàn là 'english'
+        lang = "english"
         try:
             if not Path(Settings.DATA_DIR + Settings.SETTINGS_FILE).is_file():
-                locale = getdefaultlocale()[0]
-                if locale.startswith("es"):
-                    lang = "spanish"
-                elif locale.startswith("pl"):
-                    lang = "polish"
-                elif locale.startswith("fr"):
-                    lang = "french"
-                elif locale.startswith("jp"):
-                    lang = "japanese"
-                elif locale.startswith("fa"):
-                    lang = "farsi"
-                elif locale.startswith("mt"):
-                    lang = "maltese"
-                elif locale.startswith("ru"):
-                    lang = "russian"
-                elif locale.startswith("uk"):
-                    lang = "ukrainian"
-                elif locale.startswith("de"):
-                    lang = "german"
-                elif locale.startswith("tr"):
-                    lang = "turkish"
-                elif locale.startswith("pr"):
-                    lang = "portuguese"
-                elif locale.startswith("it"):
-                    lang = "italian"
-                elif locale.startswith("sk"):
-                    lang = "slovak"
-                if locale.startswith("zh_TW"):
-                    lang = "chinese_Traditional"
-                elif locale.startswith("zh"):
-                    lang = "chinese_simplified"
-                elif locale.startswith("th"):
-                    lang = "thai"
-                elif locale.startswith("ko"):
-                    lang = "korean"
-                elif locale.startswith("id"):
-                    lang = "indonesian"
-                elif locale.startswith("cz"):
-                    lang = "czech"
-                elif locale.startswith("fi"):
-                    lang = "finnish"
-                else:
+                try:
+                    locale_info = getdefaultlocale()
+                    locale = locale_info[0] if locale_info and locale_info[0] else 'en_US'
+                    
+                    if locale.startswith("es"): lang = "spanish"
+                    elif locale.startswith("pl"): lang = "polish"
+                    elif locale.startswith("fr"): lang = "french"
+                    elif locale.startswith("jp"): lang = "japanese"
+                    elif locale.startswith("fa"): lang = "farsi"
+                    elif locale.startswith("mt"): lang = "maltese"
+                    elif locale.startswith("ru"): lang = "russian"
+                    elif locale.startswith("uk"): lang = "ukrainian"
+                    elif locale.startswith("de"): lang = "german"
+                    elif locale.startswith("tr"): lang = "turkish"
+                    elif locale.startswith("pr"): lang = "portuguese"
+                    elif locale.startswith("it"): lang = "italian"
+                    elif locale.startswith("sk"): lang = "slovak"
+                    elif locale.startswith("zh_TW"): lang = "chinese_Traditional"
+                    elif locale.startswith("zh"): lang = "chinese_simplified"
+                    elif locale.startswith("th"): lang = "thai"
+                    elif locale.startswith("ko"): lang = "korean"
+                    elif locale.startswith("id"): lang = "indonesian"
+                    elif locale.startswith("cz"): lang = "czech"
+                    elif locale.startswith("fi"): lang = "finnish"
+                    # Mặc định vẫn là 'english' nếu không khớp
+                except Exception:
                     lang = "english"
             else:
                 try:
-                    configparser.read(Settings.DATA_DIR
-                                      + Settings.SETTINGS_FILE)
-                    lang = configparser["PC Miner"]["language"]
+                    configparser.read(Settings.DATA_DIR + Settings.SETTINGS_FILE)
+                    lang_config = configparser["PC Miner"]["language"]
+                    # Chỉ chấp nhận nếu ngôn ngữ tồn tại trong lang_file
+                    if lang_config in lang_file:
+                        lang = lang_config
                 except Exception:
                     lang = "english"
         except Exception as e:
