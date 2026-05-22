@@ -10,7 +10,8 @@ from hashlib import sha1
 from socket import socket
 
 from multiprocessing import cpu_count, current_process
-from multiprocessing import Process, Manager
+# ĐÃ LOẠI BỎ multiprocessing VÀ SỬ DỤNG threading
+import threading
 from threading import Thread, Lock
 from datetime import datetime
 from random import randint
@@ -1336,11 +1337,12 @@ if __name__ == "__main__":
     check_updates()
 
     cpu = get_cpu_info()
-    accept = Manager().Value("i", 0)
-    reject = Manager().Value("i", 0)
-    blocks = Manager().Value("i", 0)
-    hashrate = Manager().dict()
-    print_queue = Manager().list()
+    # SỬ DỤNG BIẾN TOÀN CỤC THÔNG THƯỜNG THAY CHO Manager
+    accept = type('', (), {'value': 0})()
+    reject = type('', (), {'value': 0})()
+    blocks = type('', (), {'value': 0})()
+    hashrate = {}
+    print_queue = []
     Thread(target=print_queue_handler, args=[print_queue]).start()
 
     user_settings = Miner.load_cfg()
@@ -1382,13 +1384,14 @@ if __name__ == "__main__":
     fastest_pool = Client.fetch_pool()
 
     for i in range(threads):
-        p = Process(target=Miner.mine,
+        # SỬ DỤNG THREADING THAY VÌ PROCESS
+        t = Thread(target=Miner.mine,
                     args=[i, user_settings, blocks,
                           fastest_pool, accept, reject,
                           hashrate, single_miner_id, 
                           print_queue])
-        p_list.append(p)
-        p.start()
+        p_list.append(t)
+        t.start()
 
-    for p in p_list:
-        p.join()
+    for t in p_list:
+        t.join()
