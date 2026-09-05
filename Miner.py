@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#thank Duino-coin project and you too Revox
 """
 Duino-Coin Official PC Miner 4.3 © MIT licensed (iOS Adaptation)
 https://duinocoin.com | https://github.com/revoxhere/duino-coin
