@@ -22,6 +22,7 @@
 #include <csignal>
 #include <random>
 #include <algorithm>
+#include <cmath>      // CHANGE: thêm cho std::ldexp
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -55,12 +56,11 @@ static std::string g_extranonce1;
 static size_t g_extranonce2_size = 4;
 static std::atomic<uint64_t> g_extranonce2_base{0};
 
+// FIX #7: thay hai mutex bằng một mutex chung để tránh race condition
+static std::mutex g_jobMutex;
 static RawJob g_rawJob;
-static std::mutex g_rawJobMutex;
-
 static std::atomic<bool> g_haveWork{false};
 static Work g_work;
-static std::mutex g_workMutex;
 
 static std::atomic<uint64_t> g_totalHashes{0};
 static steady_clock::time_point g_lastReportTime;
@@ -99,11 +99,17 @@ static void reverseBytes(uint8_t* data, size_t len) {
     for (size_t i = 0; i < len/2; i++) std::swap(data[i], data[len-1-i]);
 }
 
+// Helper: chuyển uint64_t sang hex big-endian với độ dài cố định (số byte)
+static std::string uint64ToHexBE(uint64_t val, size_t bytes) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0') << std::setw(bytes * 2) << val;
+    return ss.str();
+}
+
 // --------------------- XÂY DỰNG HEADER ---------------------
 static bool buildHeaderFromRawJob(const RawJob& job, uint64_t extranonce2, uint8_t header[80]) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(g_extranonce2_size * 2) << extranonce2;
-    std::string extranonce2_hex = ss.str();
+    // FIX #2: dùng cùng hàm uint64ToHexBE để đảm bảo định dạng nhất quán
+    std::string extranonce2_hex = uint64ToHexBE(extranonce2, g_extranonce2_size);
     std::string coinbaseHex = job.coinb1 + g_extranonce1 + extranonce2_hex + job.coinb2;
     std::string coinbaseBin = hexToBin(coinbaseHex);
 
@@ -143,8 +149,8 @@ static bool buildHeaderFromRawJob(const RawJob& job, uint64_t extranonce2, uint8
     return true;
 }
 
-// --------------------- CẬP NHẬT WORK ---------------------
-static void updateWorkFromRawJob(const RawJob& job) {
+// --------------------- CẬP NHẬT WORK (phiên bản không tự lock) ---------------------
+static void updateWorkFromRawJobLocked(const RawJob& job) {
     Work newWork;
     newWork.jobId = job.jobId;
     newWork.nbits = std::stoul(job.nbits, nullptr, 16);
@@ -153,20 +159,28 @@ static void updateWorkFromRawJob(const RawJob& job) {
     uint32_t exp = newWork.nbits >> 24;
     uint32_t mant = newWork.nbits & 0x00FFFFFF;
     memset(newWork.target, 0, 32);
-    if (exp <= 32) {
+    // FIX #4: kiểm tra cận dưới exp >= 3 để tránh tràn buffer
+    if (exp <= 32 && exp >= 3) {
         int shift = 32 - exp;
         newWork.target[shift]   = (mant >> 16) & 0xFF;
         newWork.target[shift+1] = (mant >> 8) & 0xFF;
         newWork.target[shift+2] = mant & 0xFF;
+    } else {
+        // Nếu nbits không hợp lệ, target = 0 (không thể đào được)
     }
-    newWork.difficulty = (double)0xFFFF000000000000ULL / (double)(newWork.nbits ? newWork.nbits : 1);
 
-    {
-        std::lock_guard<std::mutex> lock(g_workMutex);
-        g_work = newWork;
-        g_haveWork = true;
-        if (job.clean) g_extranonce2_base = 0;
+    // FIX #5 (CHANGE): tính difficulty đúng từ nbits bằng std::ldexp
+    newWork.difficulty = 0.0;
+    if (exp >= 3 && exp <= 32 && mant > 0) {
+        // difficulty = (0xFFFF * 2^208) / (mant * 2^(8*(32-exp)))
+        //            = (0xFFFF / mant) * 2^(8*exp - 48)
+        newWork.difficulty = std::ldexp((double)0xFFFF / (double)mant, 8 * (int)exp - 48);
     }
+
+    // Gán vào biến toàn cục (đã có lock từ caller)
+    g_work = newWork;
+    g_haveWork = true;
+    if (job.clean) g_extranonce2_base = 0;
     std::cout << "[JOB] New work #" << newWork.jobId << " diff=" << newWork.difficulty << "\n";
 }
 
@@ -209,11 +223,13 @@ static void processStratumMessage(const std::string& line) {
             job.nbits = p[6].get<std::string>();
             job.ntime = p[7].get<std::string>();
             job.clean = p[8].get<bool>();
+
+            // FIX #7: lock chung cho cả rawJob và work
             {
-                std::lock_guard<std::mutex> lock(g_rawJobMutex);
+                std::lock_guard<std::mutex> lock(g_jobMutex);
                 g_rawJob = job;
+                updateWorkFromRawJobLocked(job);   // đã giữ lock, không cần lock thêm
             }
-            updateWorkFromRawJob(job);
             return;
         }
         if (msg.contains("method") && msg["method"] == "mining.set_difficulty") {
@@ -356,12 +372,11 @@ static void minerThreadFunc(int threadId) {
 
         RawJob rawJob;
         Work work;
+        // FIX #7: lấy cả rawJob và work trong cùng một lock
         {
-            std::lock_guard<std::mutex> lock(g_rawJobMutex);
+            std::lock_guard<std::mutex> lock(g_jobMutex);
+            if (!g_haveWork) continue;   // có thể đã bị reset
             rawJob = g_rawJob;
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_workMutex);
             work = g_work;
         }
 
@@ -370,7 +385,7 @@ static void minerThreadFunc(int threadId) {
 
         const uint32_t STEP = 65536;
         uint32_t start = threadId * STEP;
-        uint32_t end = start + STEP - 1;
+        uint32_t end = start + STEP;  // FIX #6: sửa off-by-one, chạy đủ STEP nonce
 
         for (nonce = start; nonce < end && !g_stop; ++nonce) {
             uint32_t nonce_le = __builtin_bswap32(nonce);
@@ -378,15 +393,23 @@ static void minerThreadFunc(int threadId) {
             shaCtx.hashBlockHeader(header, hash);
             g_totalHashes++;
 
+            // FIX #3: đảo ngược hash trước khi so sánh với target
+            reverseBytes(hash, 32);
+
             // So sánh với target
             if (memcmp(hash, work.target, 32) <= 0) {
+                // FIX #1: submit nonce đúng định dạng: gửi nonce_le dưới dạng hex little-endian
+                uint32_t nonce_submit = nonce_le;   // chính là nonce đã bswap, nhưng biến này lưu little-endian nên binToHex cho đúng
+                // FIX #2: gửi extranonce2 dạng hex big-endian
+                std::string extranonce2_hex = uint64ToHexBE(myExtNonce2, g_extranonce2_size);
+
                 json submit;
                 submit["id"] = 4;
                 submit["method"] = "mining.submit";
                 submit["params"] = {g_user, work.jobId,
-                                    binToHex((uint8_t*)&myExtNonce2, g_extranonce2_size),
+                                    extranonce2_hex,
                                     rawJob.ntime,
-                                    binToHex((uint8_t*)&nonce, 4)};
+                                    binToHex((uint8_t*)&nonce_submit, 4)};
                 sendStratum(submit.dump());
                 std::cout << "[FOUND] Thread " << threadId << " nonce=0x" << std::hex << nonce << std::dec << "\n";
                 break;
